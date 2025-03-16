@@ -216,9 +216,13 @@ class AITerminal:
             bool: True if the task appears complex, False otherwise
         """
         # Use OpenAI to determine if this is a complex task requiring multiple steps
+        
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
         messages = [
             {"role": "system", "content": "You are a helpful assistant that determines if a task requires multiple shell commands to complete. Respond with 'yes' or 'no'."},
-            {"role": "user", "content": f"Does this task require multiple shell commands to complete? Task: {user_input}"}
+            {"role": "user", "content": f"Does this task require multiple shell commands to complete? Task: {user_input}\n\nDirectory Information:\n{dir_context}"}
         ]
         
         self.log_debug(f"Checking complexity of task: {user_input}")
@@ -254,9 +258,15 @@ class AITerminal:
         Use macOS-compatible syntax (zsh/bash). If multiple commands are needed, use && to chain them or ; for sequential execution.
         """
         
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
         user_message = user_input
         if context:
             user_message += f"\n\nContext from previous execution: {context}"
+        
+        # Add directory context
+        user_message += f"\n\nDirectory Information:\n{dir_context}"
         
         messages = [
             {"role": "system", "content": system_message},
@@ -264,6 +274,7 @@ class AITerminal:
         ]
         
         self.log_debug(f"Generating command for: {user_input}")
+        self.log_debug(f"With directory context: {dir_context}")
         
         try:
             response = openai.chat.completions.create(
@@ -371,10 +382,13 @@ class AITerminal:
             Respond with ONLY "dangerous" or "safe" without any explanation.
             """
             
+            # Get directory context
+            dir_context = self.get_directory_context()
+            
             # Create the message list
             messages = [
                 {"role": "system", "content": system_message},
-                {"role": "user", "content": f"Assess this command: {command}"}
+                {"role": "user", "content": f"Assess this command: {command}\n\nDirectory Information:\n{dir_context}"}
             ]
             
             # Get response from OpenAI
@@ -506,7 +520,10 @@ class AITerminal:
         - user_prompt: Question to ask the user if ask_user is true (or null)
         """
         
-        user_message = f"Command: {command}\n\nError output: {error_output}"
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        user_message = f"Command: {command}\n\nError output: {error_output}\n\nDirectory Information:\n{dir_context}"
         
         messages = [
             {"role": "system", "content": system_message},
@@ -569,9 +586,14 @@ class AITerminal:
         - critical: Boolean indicating if this step is critical (failure should stop execution)
         """
         
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        user_content = f"Task: {task}\n\nDirectory Information:\n{dir_context}"
+        
         messages = [
             {"role": "system", "content": system_message},
-            {"role": "user", "content": f"Task: {task}"}
+            {"role": "user", "content": user_content}
         ]
         
         try:
@@ -628,6 +650,36 @@ class AITerminal:
             if self.debug:
                 import traceback
                 console.print(traceback.format_exc())
+    
+    def get_directory_context(self) -> str:
+        """
+        Get context information about the current directory environment.
+        
+        Returns:
+            str: Context information about current directory and environment
+        """
+        try:
+            # Get current directory path
+            current_dir = os.getcwd()
+            
+            # Get directory contents (files and folders)
+            dir_contents = os.listdir(current_dir)
+            # Limit the list to avoid excessive information
+            if len(dir_contents) > 10:
+                dir_contents = dir_contents[:10] + ["..."]
+            
+            # Get parent directory
+            parent_dir = os.path.dirname(current_dir)
+            
+            # Construct the context information
+            context = f"Current directory: {current_dir}\n"
+            context += f"Parent directory: {parent_dir}\n"
+            context += f"Directory contents: {', '.join(dir_contents)}\n"
+            
+            return context
+        except Exception as e:
+            self.log_debug(f"Error getting directory context: {str(e)}")
+            return "Unable to determine directory context."
 
 
 class MemoryManager:
