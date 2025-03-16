@@ -16,6 +16,8 @@ import argparse
 import subprocess
 import time
 import psutil
+import shlex
+import glob
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -40,6 +42,8 @@ console = Console()
 # Constants
 DB_PATH = Path.home() / ".ai_terminal_memory.db"
 MAX_MEMORY_ENTRIES = 50
+LOGS_FOLDER = Path.home() / ".ai_terminal_logs"
+MAX_LOG_FILES = 10  # Maximum number of log files to keep
 DANGEROUS_COMMANDS = [
     "rm -rf /", 
     "rm -rf /*", 
@@ -52,23 +56,173 @@ DANGEROUS_COMMANDS = [
     "mv /home /dev/null"
 ]
 
+class FileLogger:
+    """Handles conversation logging using plain text files."""
+    
+    def __init__(self, logs_folder=LOGS_FOLDER, max_log_files=MAX_LOG_FILES):
+        """Initialize the file logger."""
+        # Create logs directory if it doesn't exist
+        self.logs_folder = logs_folder
+        self.max_log_files = max_log_files
+        
+        # Convert to Path object if it's a string
+        if isinstance(self.logs_folder, str):
+            self.logs_folder = Path(self.logs_folder)
+            
+        # Print log location for visibility
+        print(f"Initializing logger - logs will be stored in: {self.logs_folder}")
+        
+        # Create the logs directory
+        try:
+            os.makedirs(self.logs_folder, exist_ok=True)
+            print(f"Log directory created/verified at: {self.logs_folder}")
+        except Exception as e:
+            print(f"Error creating log directory: {e}")
+            # Fallback to temp directory if home directory fails
+            self.logs_folder = Path('/tmp') / ".ai_terminal_logs"
+            os.makedirs(self.logs_folder, exist_ok=True)
+            print(f"Using fallback log directory: {self.logs_folder}")
+        
+        # Generate a unique ID for this conversation
+        self.conversation_id = f"conversation_{int(datetime.now().timestamp())}"
+        self.log_file = self.logs_folder / f"{self.conversation_id}.log"
+        
+        # Initialize the log file with a header
+        try:
+            with open(self.log_file, 'w') as f:
+                f.write(f"AI Terminal Conversation Log\n")
+                f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Conversation ID: {self.conversation_id}\n")
+                f.write("-" * 80 + "\n\n")
+            print(f"Created log file: {self.log_file}")
+        except Exception as e:
+            print(f"Error writing to log file: {e}")
+        
+        # Clean up old log files
+        self._cleanup_old_logs()
+    
+    def _cleanup_old_logs(self):
+        """Remove old log files, keeping only the most recent ones."""
+        try:
+            log_files = sorted(glob.glob(str(self.logs_folder / "conversation_*.log")), key=os.path.getmtime, reverse=True)
+            
+            # Keep only the most recent max_log_files
+            if len(log_files) > self.max_log_files:
+                for old_file in log_files[self.max_log_files:]:
+                    try:
+                        os.remove(old_file)
+                        print(f"Removed old log file: {old_file}")
+                    except Exception as e:
+                        print(f"Warning: Could not remove old log file {old_file}: {e}")
+        except Exception as e:
+            print(f"Error during log cleanup: {e}")
+    
+    def log_user_query(self, query: str):
+        """
+        Log a user query to the conversation file.
+        
+        Args:
+            query: The user's query text
+        """
+        with open(self.log_file, 'a') as f:
+            f.write(f"\nUSER [{datetime.now().strftime('%H:%M:%S')}]: {query}\n")
+    
+    def log_command(self, command: str):
+        """
+        Log a generated command to the conversation file.
+        
+        Args:
+            command: The shell command to be executed
+        """
+        with open(self.log_file, 'a') as f:
+            f.write(f"\nCOMMAND [{datetime.now().strftime('%H:%M:%S')}]: {command}\n")
+    
+    def log_result(self, result: str, success: bool):
+        """
+        Log command execution results to the conversation file.
+        
+        Args:
+            result: The command output
+            success: Whether the command succeeded
+        """
+        # Truncate very long results
+        if len(result) > 2000:
+            result = result[:1997] + "..."
+            
+        with open(self.log_file, 'a') as f:
+            status = "SUCCESS" if success else "FAILURE"
+            f.write(f"\nRESULT [{datetime.now().strftime('%H:%M:%S')}] ({status}):\n")
+            f.write(result + "\n")
+    
+    def log_system_message(self, message: str):
+        """
+        Log a system message to the conversation file.
+        
+        Args:
+            message: The system message
+        """
+        with open(self.log_file, 'a') as f:
+            f.write(f"\nSYSTEM [{datetime.now().strftime('%H:%M:%S')}]: {message}\n")
+    
+    def get_conversation_history(self) -> str:
+        """
+        Get the entire conversation history from the log file.
+        
+        Returns:
+            str: The conversation history as a string
+        """
+        try:
+            with open(self.log_file, 'r') as f:
+                return f.read()
+        except Exception as e:
+            return f"Error reading log file: {str(e)}"
+    
+    def get_all_conversation_logs(self, limit: int = 5) -> List[str]:
+        """
+        Get content from multiple conversation logs.
+        
+        Args:
+            limit: Maximum number of log files to retrieve
+            
+        Returns:
+            List[str]: List of conversation logs as strings
+        """
+        log_files = sorted(glob.glob(str(self.logs_folder / "conversation_*.log")), key=os.path.getmtime, reverse=True)
+        logs = []
+        
+        for log_file in log_files[:limit]:
+            try:
+                with open(log_file, 'r') as f:
+                    logs.append(f.read())
+            except Exception as e:
+                logs.append(f"Error reading log file {log_file}: {str(e)}")
+        
+        return logs
+
 class AITerminal:
     """AI-Powered Terminal application that converts natural language to shell commands."""
     
-    def __init__(self, mode: str = "manual", debug: bool = False):
+    def __init__(self, mode: str = "manual", debug: bool = False, max_plan_iterations: int = 5, 
+                 direct_execution: bool = True, refine_queries: bool = True):
         """
         Initialize the AI Terminal.
         
         Args:
             mode: Execution mode - 'manual' or 'autonomous'
             debug: Enable debug logging
+            max_plan_iterations: Maximum number of iterations for plan verification
+            direct_execution: Enable direct execution of shell commands if detected
+            refine_queries: Enable query refinement via API
         """
         self.mode = mode
         self.debug = debug
-        self.memory = MemoryManager()
+        self.memory = MemoryManager()  # Keep for backward compatibility
+        self.logger = FileLogger()  # New file-based logger
         self.shell = os.environ.get("SHELL", "/bin/zsh")
         self.command_history = []
-        self.setup_database()
+        self.max_plan_iterations = max_plan_iterations
+        self.direct_execution = direct_execution
+        self.refine_queries = refine_queries
         self.current_task = None
         
         # Check for API key
@@ -80,38 +234,26 @@ class AITerminal:
         console.print(Panel.fit(
             "[bold blue]AI Terminal[/bold blue]\n"
             f"Mode: [bold]{'Autonomous' if self.mode == 'autonomous' else 'Manual'}[/bold]\n"
+            f"Max Plan Iterations: [bold]{self.max_plan_iterations}[/bold]\n"
+            f"Direct Execution: [bold]{'Enabled' if self.direct_execution else 'Disabled'}[/bold]\n"
+            f"Query Refinement: [bold]{'Enabled' if self.refine_queries else 'Disabled'}[/bold]\n"
+            f"Log File: [bold]{self.logger.log_file}[/bold]\n"
+            f"Logs Directory: [bold]{self.logger.logs_folder}[/bold]\n"
             "Type 'exit' or 'quit' to exit, 'help' for help.",
             title="Welcome"
         ))
+        
+        # Log system startup
+        self.logger.log_system_message(f"AI Terminal started in {mode} mode with the following settings:\n"
+                                       f"Max Plan Iterations: {max_plan_iterations}\n"
+                                       f"Direct Execution: {'Enabled' if direct_execution else 'Disabled'}\n"
+                                       f"Query Refinement: {'Enabled' if refine_queries else 'Disabled'}\n"
+                                       f"Logs Directory: {self.logger.logs_folder}")
     
     def setup_database(self):
         """Set up the SQLite database for memory storage."""
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Create tables if they don't exist
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS memory (
-            id INTEGER PRIMARY KEY,
-            timestamp TEXT,
-            task TEXT,
-            commands TEXT,
-            results TEXT,
-            success INTEGER
-        )
-        ''')
-        
-        # Create session table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS session (
-            id INTEGER PRIMARY KEY,
-            timestamp TEXT,
-            current_task TEXT
-        )
-        ''')
-        
-        conn.commit()
-        conn.close()
+        # This is now handled by the MemoryManager class
+        pass
     
     def log_debug(self, message: str):
         """Log a debug message if debug mode is enabled."""
@@ -140,6 +282,21 @@ class AITerminal:
                 if user_input.lower() in ("switch mode", "toggle mode"):
                     self.mode = "autonomous" if self.mode == "manual" else "manual"
                     console.print(f"[bold blue]Switched to {self.mode} mode[/bold blue]")
+                    self.logger.log_system_message(f"Switched to {self.mode} mode")
+                    continue
+                
+                # Check for log viewing commands
+                if user_input.lower() in ("show log", "view log"):
+                    self._show_current_log()
+                    continue
+                
+                if user_input.lower() in ("show logs", "list logs"):
+                    self._list_all_logs()
+                    continue
+                
+                # Check for command to open logs directory
+                if user_input.lower() in ("open logs", "open log folder", "open logs folder"):
+                    self._open_logs_directory()
                     continue
                 
                 # Process the user's request
@@ -153,6 +310,53 @@ class AITerminal:
                 import traceback
                 console.print(traceback.format_exc())
     
+    def _show_current_log(self):
+        """Display the current conversation log."""
+        log_content = self.logger.get_conversation_history()
+        
+        console.print("\n[bold blue]Current Conversation Log:[/bold blue]")
+        console.print(Panel(log_content, title=f"Log File: {self.logger.log_file}", expand=False))
+        
+        self.logger.log_system_message("User viewed the current conversation log")
+    
+    def _list_all_logs(self):
+        """List all available conversation logs."""
+        log_files = sorted(glob.glob(str(self.logger.logs_folder / "conversation_*.log")), key=os.path.getmtime, reverse=True)
+        
+        console.print("\n[bold blue]Available Conversation Logs:[/bold blue]")
+        
+        for i, log_file in enumerate(log_files, 1):
+            path = Path(log_file)
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            formatted_time = mtime.strftime("%Y-%m-%d %H:%M:%S")
+            size_kb = path.stat().st_size / 1024
+            
+            console.print(f"{i}. [cyan]{path.name}[/cyan] - {formatted_time} ({size_kb:.1f} KB)")
+        
+        if not log_files:
+            console.print("[yellow]No conversation logs found.[/yellow]")
+        
+        self.logger.log_system_message("User listed all conversation logs")
+    
+    def _open_logs_directory(self):
+        """Open the logs directory in Finder."""
+        console.print(f"\n[blue]Opening logs directory: {self.logger.logs_folder}[/blue]")
+        
+        try:
+            if sys.platform == 'darwin':  # macOS
+                subprocess.run(['open', str(self.logger.logs_folder)])
+            elif sys.platform == 'win32':  # Windows
+                subprocess.run(['explorer', str(self.logger.logs_folder)])
+            elif sys.platform == 'linux':  # Linux
+                subprocess.run(['xdg-open', str(self.logger.logs_folder)])
+            else:
+                console.print(f"[yellow]Unsupported platform: {sys.platform}. Please manually navigate to {self.logger.logs_folder}[/yellow]")
+            
+            self.logger.log_system_message(f"User opened logs directory: {self.logger.logs_folder}")
+        except Exception as e:
+            console.print(f"[bold red]Error opening logs directory: {str(e)}[/bold red]")
+            self.logger.log_system_message(f"Error opening logs directory: {str(e)}")
+    
     def show_help(self):
         """Show help information."""
         help_text = """
@@ -162,13 +366,35 @@ class AITerminal:
         - `exit` or `quit`: Exit the AI Terminal
         - `help`: Show this help message
         - `switch mode` or `toggle mode`: Switch between manual and autonomous modes
+        - `show log` or `view log`: Display the current conversation log
+        - `show logs` or `list logs`: List all available conversation logs
+        - `open logs` or `open logs folder`: Open the logs directory in your file explorer
         
         ## Current Mode
         - Current mode: {mode}
+        - Max plan iterations: {max_iterations}
+        - Direct execution: {direct_execution}
+        - Query refinement: {query_refinement}
+        - Log file: {log_file}
+        - Logs directory: {logs_folder}
         
         ## Modes
         - **Manual Mode**: The AI suggests commands but will only ask for confirmation if they appear dangerous
         - **Autonomous Mode**: Same as manual mode but may perform more complex actions independently
+        
+        ## Features
+        - **Direct Execution**: When enabled, shell commands entered directly are executed without AI processing
+        - **Query Refinement**: When enabled, user inputs are refined via API for better clarity
+        - **Plan Verification**: Complex tasks go through plan verification and refinement (up to {max_iterations} iterations)
+        - **Conversation Logging**: All interactions are logged to plain text files in {logs_folder}
+        
+        ## Context Awareness
+        The AI Terminal remembers your previous commands, their results, and conversations.
+        You can ask questions about previous operations, for example:
+        - "What was the last command you executed?"
+        - "What was the output of the last command?"
+        - "Show me what you've done so far"
+        - "What command did you use to do X?"
         
         ## Safety Features
         - Commands are analyzed for potential risks using both rule-based checks and AI
@@ -180,9 +406,18 @@ class AITerminal:
         - "Install Node.js using Homebrew"
         - "Create a new React project in ~/Projects"
         - "Check disk usage and show the largest directories"
+        - "ls -la" (direct execution)
+        - "What was the last command you ran?" (context query)
         """
         
-        help_text = help_text.format(mode="Autonomous" if self.mode == "autonomous" else "Manual")
+        help_text = help_text.format(
+            mode="Autonomous" if self.mode == "autonomous" else "Manual",
+            max_iterations=self.max_plan_iterations,
+            direct_execution="Enabled" if self.direct_execution else "Disabled",
+            query_refinement="Enabled" if self.refine_queries else "Disabled",
+            log_file=self.logger.log_file,
+            logs_folder=self.logger.logs_folder
+        )
         console.print(Markdown(help_text))
     
     def process_request(self, user_input: str):
@@ -194,16 +429,70 @@ class AITerminal:
         """
         # Set the current task
         self.current_task = user_input
-        self.memory.store_task(user_input)
+        
+        # Log the user query
+        self.logger.log_user_query(user_input)
+        
+        # Check if the request is about context/conversation history
+        if self.is_context_request(user_input):
+            self.handle_context_request(user_input)
+            return
+        
+        # Check if user input is a direct shell command
+        if self.direct_execution and self.is_shell_command(user_input):
+            console.print("[blue]Detected shell command. Executing directly...[/blue]")
+            self.execute_with_confirmation(user_input, "Direct shell command execution")
+            return
+            
+        # Refine the query if enabled
+        if self.refine_queries:
+            refined_input = self.refine_user_query(user_input)
+            if refined_input != user_input:
+                self.current_task = refined_input
+                self.logger.log_system_message(f"Refined query: {refined_input}")
+        else:
+            refined_input = user_input
         
         # If the task requires multiple steps, use agent mode
-        if self.is_complex_task(user_input):
+        if self.is_complex_task(refined_input):
             console.print("[blue]This looks like a complex task. Using Agent Mode to break it down...[/blue]")
-            self.agent_mode(user_input)
+            self.agent_mode(refined_input)
         else:
             # Generate a command for the request
-            command = self.generate_command(user_input)
+            command = self.generate_command(refined_input)
             self.execute_with_confirmation(command)
+    
+    def is_context_request(self, user_input: str) -> bool:
+        """
+        Determine if the user is asking about previous actions or context.
+        
+        Args:
+            user_input: User's input
+            
+        Returns:
+            bool: True if this is a context-related question
+        """
+        # Common patterns for context-related questions
+        context_patterns = [
+            r'what (file|files|directory|folder).*(create|made|did)',
+            r'what (did|have) you (do|done|create|made)',
+            r'show me what you (did|have done)',
+            r'what (was|were) the (result|output)',
+            r'what happened (when|with)',
+            r'can you (tell|remind) me (what|which)',
+            r'what (commands?|actions?) (did|have) you (run|execute|performed?)',
+            r'(list|show) (the|all) files you (created|modified|changed)',
+            r'what (is|was) the last (command|file|action)'
+        ]
+        
+        user_input_lower = user_input.lower()
+        
+        for pattern in context_patterns:
+            if re.search(pattern, user_input_lower):
+                self.log_debug(f"Detected context request: {user_input}")
+                return True
+                
+        return False
     
     def is_complex_task(self, user_input: str) -> bool:
         """
@@ -238,12 +527,63 @@ class AITerminal:
             )
             response_text = response.choices[0].message.content.strip().lower()
             self.log_debug(f"Complexity check response: {response_text}")
-            return "yes" in response_text
+            
+            # Log the complexity assessment
+            is_complex = "yes" in response_text
+            self.logger.log_system_message(f"Task complexity assessment: {'Complex' if is_complex else 'Simple'}")
+            
+            return is_complex
         except Exception as e:
             self.log_debug(f"Error in complexity check: {str(e)}")
+            self.logger.log_system_message(f"Error in complexity check: {str(e)}")
             # Default to simple task on error
             return False
     
+    def handle_context_request(self, user_input: str):
+        """
+        Handle requests about previous actions or context.
+        
+        Args:
+            user_input: User's question about context
+        """
+        console.print("[blue]Searching conversation history for context...[/blue]")
+        
+        # Get conversation history from log file
+        conversation_history = self.logger.get_conversation_history()
+        
+        # Use OpenAI to generate a response based on the context
+        system_message = """You are an AI assistant that helps users understand their command-line history and context.
+        Answer the user's question about previous commands, files, or actions based on the provided conversation history.
+        Be specific, accurate, and brief in your response.
+        If you can't find relevant information in the history, politely say so.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Question: {user_input}\n\nConversation History:\n{conversation_history}"}
+        ]
+        
+        try:
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.3
+            )
+            
+            # Display the response
+            answer = response.choices[0].message.content.strip()
+            console.print(Markdown(answer))
+            
+            # Log the response
+            self.logger.log_system_message(f"Response to context query: {answer}")
+            
+        except Exception as e:
+            error_msg = f"Error generating context response: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
+            
     def generate_command(self, user_input: str, context: str = "") -> str:
         """
         Generate a shell command from natural language.
@@ -263,12 +603,16 @@ class AITerminal:
         # Get directory context
         dir_context = self.get_directory_context()
         
+        # Get conversation history from log file
+        conversation_history = self.logger.get_conversation_history()
+        
         user_message = user_input
         if context:
             user_message += f"\n\nContext from previous execution: {context}"
         
-        # Add directory context
+        # Add directory and conversation context
         user_message += f"\n\nDirectory Information:\n{dir_context}"
+        user_message += f"\n\nRecent Conversation History:\n{conversation_history}"
         
         messages = [
             {"role": "system", "content": system_message},
@@ -276,7 +620,6 @@ class AITerminal:
         ]
         
         self.log_debug(f"Generating command for: {user_input}")
-        self.log_debug(f"With directory context: {dir_context}")
         
         try:
             # Show thinking animation while waiting for API response
@@ -288,9 +631,15 @@ class AITerminal:
             )
             command = response.choices[0].message.content.strip()
             self.log_debug(f"Generated command: {command}")
+            
+            # Log the generated command
+            self.logger.log_command(command)
+            
             return command
         except Exception as e:
-            console.print(f"[bold red]Error generating command: {str(e)}[/bold red]")
+            error_msg = f"Error generating command: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
             return ""
     
     def execute_with_confirmation(self, command: str, context: str = ""):
@@ -486,13 +835,8 @@ class AITerminal:
             status_str = "[bold green]Success[/bold green]" if success else "[bold red]Failed[/bold red]"
             console.print(f"\n{status_str} (Exit code: {process.returncode}, Time: {execution_time:.2f}s)")
             
-            # Store command results in memory
-            self.memory.store_command_result(
-                self.current_task, 
-                command, 
-                combined_output, 
-                success
-            )
+            # Log the result
+            self.logger.log_result(combined_output, success)
             
             # If the command failed, attempt to fix or provide context
             if not success and errors:
@@ -503,6 +847,7 @@ class AITerminal:
         except Exception as e:
             error_msg = f"Error executing command: {str(e)}"
             console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
             return error_msg, False
     
     def handle_error(self, command: str, error_output: str):
@@ -514,6 +859,7 @@ class AITerminal:
             error_output: Error message from command execution
         """
         console.print("[blue]Analyzing error...[/blue]")
+        self.logger.log_system_message("Analyzing command error...")
         
         # Use OpenAI to analyze the error
         system_message = """You are an AI assistant that analyzes shell command errors and suggests fixes.
@@ -528,7 +874,10 @@ class AITerminal:
         # Get directory context
         dir_context = self.get_directory_context()
         
-        user_message = f"Command: {command}\n\nError output: {error_output}\n\nDirectory Information:\n{dir_context}"
+        # Get conversation history
+        conv_history = self.logger.get_conversation_history()
+        
+        user_message = f"Command: {command}\n\nError output: {error_output}\n\nDirectory Information:\n{dir_context}\n\nRecent Conversation History:\n{conv_history}"
         
         messages = [
             {"role": "system", "content": system_message},
@@ -549,10 +898,13 @@ class AITerminal:
             
             # Display explanation
             console.print(f"[yellow]Error Analysis: {result['explanation']}[/yellow]")
+            self.logger.log_system_message(f"Error Analysis: {result['explanation']}")
             
             # If we need user input
             if result.get('ask_user', False) and result.get('user_prompt'):
                 user_input = Prompt.ask(f"[bold]{result['user_prompt']}[/bold]")
+                self.logger.log_user_query(f"Response to prompt: {user_input}")
+                
                 if user_input:
                     # Generate a new command with user input
                     new_context = f"Previous command '{command}' failed with error: {error_output}\nUser provided: {user_input}"
@@ -563,6 +915,7 @@ class AITerminal:
             elif result.get('fix_command'):
                 console.print("[green]Suggested fix:[/green]")
                 console.print(Syntax(result['fix_command'], "bash", theme="monokai", line_numbers=False))
+                self.logger.log_system_message(f"Suggested fix: {result['fix_command']}")
                 
                 if self.mode == "autonomous" or Confirm.ask("Try this fix?", default=True):
                     self.execute_command(result['fix_command'])
@@ -570,9 +923,12 @@ class AITerminal:
             # If no fix is available
             else:
                 console.print("[yellow]No automatic fix available for this error.[/yellow]")
+                self.logger.log_system_message("No automatic fix available for this error.")
                 
         except Exception as e:
-            console.print(f"[bold red]Error analyzing command failure: {str(e)}[/bold red]")
+            error_msg = f"Error analyzing command failure: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
     
     def agent_mode(self, task: str):
         """
@@ -584,6 +940,61 @@ class AITerminal:
         console.print("[bold blue]Agent Mode activated[/bold blue]")
         console.print(f"Task: [bold]{task}[/bold]")
         
+        # Get initial step-by-step plan from OpenAI
+        plan = self.generate_plan(task)
+        
+        if not plan or 'steps' not in plan or not plan['steps']:
+            console.print("[bold red]Failed to generate a plan for this task.[/bold red]")
+            return
+        
+        # Verify and refine the plan through iterations
+        plan = self.verify_and_refine_plan(task, plan)
+            
+        # Display the final plan
+        console.print("\n[bold blue]Execution Plan:[/bold blue]")
+        for i, step in enumerate(plan['steps'], 1):
+            console.print(f"[bold]{i}.[/bold] {step['description']}")
+            console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+            console.print()
+        
+        # Ask for confirmation to execute the plan
+        if self.mode == "manual" and not Confirm.ask("Execute this plan?", default=True):
+            console.print("[blue]Plan execution cancelled.[/blue]")
+            return
+        
+        # Execute each step in the plan
+        for i, step in enumerate(plan['steps'], 1):
+            console.print(f"\n[bold blue]Step {i}/{len(plan['steps'])}: {step['description']}[/bold blue]")
+            
+            # Execute with or without confirmation based on mode
+            if self.mode == "manual":
+                self.execute_with_confirmation(step['command'], f"Step {i}/{len(plan['steps'])}")
+            else:
+                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+                output, success = self.execute_command(step['command'])
+                
+                # If a critical step failed, stop execution
+                if not success and step.get('critical', False):
+                    console.print("[bold red]Critical step failed. Stopping execution.[/bold red]")
+                    
+                    # Ask if user wants to try to fix and continue
+                    if Confirm.ask("Would you like me to try to fix this and continue?", default=True):
+                        self.handle_error(step['command'], output)
+                    else:
+                        break
+        
+        console.print("\n[bold green]Plan execution completed.[/bold green]")
+    
+    def generate_plan(self, task: str) -> Dict:
+        """
+        Generate a step-by-step plan for a complex task.
+        
+        Args:
+            task: Complex task description
+            
+        Returns:
+            Dict: Plan in JSON format with an array of steps
+        """
         # Get step-by-step plan from OpenAI
         system_message = """You are an AI assistant that breaks down complex tasks into a series of shell commands for macOS.
         Create a step-by-step plan with specific shell commands to accomplish the user's goal.
@@ -614,51 +1025,147 @@ class AITerminal:
             )
             
             plan = json.loads(response.choices[0].message.content)
-            
-            if 'steps' not in plan or not plan['steps']:
-                console.print("[bold red]Failed to generate a plan for this task.[/bold red]")
-                return
-            
-            # Display the plan
-            console.print("\n[bold blue]Execution Plan:[/bold blue]")
-            for i, step in enumerate(plan['steps'], 1):
-                console.print(f"[bold]{i}.[/bold] {step['description']}")
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                console.print()
-            
-            # Ask for confirmation to execute the plan
-            if self.mode == "manual" and not Confirm.ask("Execute this plan?", default=True):
-                console.print("[blue]Plan execution cancelled.[/blue]")
-                return
-            
-            # Execute each step in the plan
-            for i, step in enumerate(plan['steps'], 1):
-                console.print(f"\n[bold blue]Step {i}/{len(plan['steps'])}: {step['description']}[/bold blue]")
-                
-                # Execute with or without confirmation based on mode
-                if self.mode == "manual":
-                    self.execute_with_confirmation(step['command'], f"Step {i}/{len(plan['steps'])}")
-                else:
-                    console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                    output, success = self.execute_command(step['command'])
-                    
-                    # If a critical step failed, stop execution
-                    if not success and step.get('critical', False):
-                        console.print("[bold red]Critical step failed. Stopping execution.[/bold red]")
-                        
-                        # Ask if user wants to try to fix and continue
-                        if Confirm.ask("Would you like me to try to fix this and continue?", default=True):
-                            self.handle_error(step['command'], output)
-                        else:
-                            break
-            
-            console.print("\n[bold green]Plan execution completed.[/bold green]")
+            return plan
             
         except Exception as e:
-            console.print(f"[bold red]Error in Agent Mode: {str(e)}[/bold red]")
+            console.print(f"[bold red]Error generating plan: {str(e)}[/bold red]")
             if self.debug:
                 import traceback
                 console.print(traceback.format_exc())
+            return None
+    
+    def verify_and_refine_plan(self, task: str, initial_plan: Dict) -> Dict:
+        """
+        Verify and refine a plan through multiple iterations.
+        
+        Args:
+            task: Original task description
+            initial_plan: Initial plan generated
+            
+        Returns:
+            Dict: Final verified and refined plan
+        """
+        current_plan = initial_plan
+        iterations = 0
+        
+        console.print("[blue]Verifying and refining the plan...[/blue]")
+        
+        while iterations < self.max_plan_iterations:
+            # Create a progress message
+            if iterations > 0:
+                console.print(f"[dim]Plan refinement iteration {iterations+1}/{self.max_plan_iterations}[/dim]")
+            
+            # Verify the current plan
+            verification_result = self.verify_plan(task, current_plan)
+            
+            # If the plan is verified as good, break the loop
+            if verification_result.get('is_good', False):
+                console.print("[green]Plan verification completed: Plan is sound.[/green]")
+                break
+                
+            # If refinements are suggested, update the plan
+            if 'refined_plan' in verification_result and verification_result['refined_plan']:
+                # Check if the refined plan is different from the current one
+                if verification_result['refined_plan'] != current_plan:
+                    console.print("[blue]Refining plan based on verification feedback...[/blue]")
+                    current_plan = verification_result['refined_plan']
+                else:
+                    # No changes in the plan, break the loop
+                    console.print("[green]Plan verification completed: No further refinements needed.[/green]")
+                    break
+            else:
+                # No refinements suggested, break the loop
+                console.print("[yellow]Plan verification completed: No refinements suggested.[/yellow]")
+                break
+                
+            iterations += 1
+            
+        if iterations >= self.max_plan_iterations:
+            console.print("[yellow]Reached maximum plan refinement iterations.[/yellow]")
+            
+        return current_plan
+    
+    def verify_plan(self, task: str, plan: Dict) -> Dict:
+        """
+        Verify a plan using OpenAI API.
+        
+        Args:
+            task: Original task description
+            plan: Plan to verify
+            
+        Returns:
+            Dict: Verification result with is_good flag and possibly a refined_plan
+        """
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        # Get conversation history
+        conv_history = self.logger.get_conversation_history()
+        
+        # Create a system message for plan verification
+        system_message = """You are an AI assistant that verifies the soundness of shell command execution plans.
+        Analyze the given plan and task to determine if:
+        1. The plan accomplishes the task completely
+        2. The commands are correct and efficient
+        3. The steps are in the right order
+        4. There are no missing steps
+        5. There are no unnecessary steps
+        
+        If improvements are needed, provide a refined plan in the same format.
+        Format your response as JSON with:
+        - is_good: Boolean indicating if the plan is sound (true) or needs refinement (false)
+        - feedback: Brief explanation of your assessment
+        - refined_plan: The improved plan if is_good is false, otherwise null
+        """
+        
+        # Convert plan to a formatted string for readability
+        plan_text = json.dumps(plan, indent=2)
+        
+        # Create the user message
+        user_content = f"""Task: {task}
+
+Proposed Plan:
+{plan_text}
+
+Directory Information:
+{dir_context}
+
+Recent Conversation History:
+{conv_history}
+
+Please verify if this plan is sound and complete for accomplishing the task."""
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_content}
+        ]
+        
+        try:
+            # Call the API with animation
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            # Parse the response
+            result = json.loads(response.choices[0].message.content)
+            
+            # Display feedback
+            if 'feedback' in result:
+                console.print(f"[dim]Verification feedback: {result['feedback']}[/dim]")
+                self.logger.log_system_message(f"Plan verification feedback: {result['feedback']}")
+                
+            return result
+            
+        except Exception as e:
+            error_msg = f"Error verifying plan: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
+            # Return a default result indicating the plan is good to avoid blocking execution
+            return {"is_good": True, "feedback": "Verification failed, proceeding with original plan."}
     
     def get_directory_context(self) -> str:
         """
@@ -714,6 +1221,134 @@ class AITerminal:
                 # Log any errors but don't display to user yet (caller will handle that)
                 self.log_debug(f"API call error: {str(e)}")
                 raise
+    
+    def is_shell_command(self, user_input: str) -> bool:
+        """
+        Determine if user input is likely a shell command that can be executed directly.
+        
+        Args:
+            user_input: User's input
+            
+        Returns:
+            bool: True if the input appears to be a shell command, False otherwise
+        """
+        # Trim leading/trailing whitespace
+        user_input = user_input.strip()
+        
+        # Check if input is empty
+        if not user_input:
+            return False
+        
+        # Common shell command patterns
+        shell_command_prefixes = [
+            'ls', 'cd', 'mkdir', 'touch', 'rm', 'cp', 'mv', 'cat', 'echo', 'grep',
+            'find', 'ps', 'kill', 'chmod', 'chown', 'tar', 'zip', 'unzip', 'ssh',
+            'scp', 'git', 'npm', 'pip', 'python', 'node', 'brew', 'apt', 'yum',
+            'docker', 'kubectl', 'aws', 'curl', 'wget', 'sudo', 'vim', 'nano'
+        ]
+        
+        # Check if input starts with a common shell command
+        first_word = user_input.split()[0]
+        
+        if first_word in shell_command_prefixes:
+            self.log_debug(f"Detected shell command: {user_input}")
+            return True
+            
+        # Check if input contains shell operators or pipes
+        shell_operators = ['|', '>', '>>', '<', '&&', '||', ';', '&']
+        for operator in shell_operators:
+            if operator in user_input:
+                # Make sure the operator isn't part of a quoted string
+                if not self._is_in_quotes(user_input, operator):
+                    self.log_debug(f"Detected shell operator in command: {user_input}")
+                    return True
+                    
+        return False
+        
+    def _is_in_quotes(self, text: str, substring: str) -> bool:
+        """
+        Check if a substring appears only inside quotes in the text.
+        
+        Args:
+            text: The full text string
+            substring: The substring to check
+            
+        Returns:
+            bool: True if the substring only appears inside quotes, False otherwise
+        """
+        in_single_quotes = False
+        in_double_quotes = False
+        
+        for i in range(len(text)):
+            # Toggle quote state
+            if text[i] == "'" and not in_double_quotes:
+                in_single_quotes = not in_single_quotes
+            elif text[i] == '"' and not in_single_quotes:
+                in_double_quotes = not in_double_quotes
+                
+            # Check if we're at the start of our substring
+            if i <= len(text) - len(substring) and text[i:i+len(substring)] == substring:
+                # If we're not in quotes, the substring is not exclusively in quotes
+                if not in_single_quotes and not in_double_quotes:
+                    return False
+        
+        # If we've found instances but they were all in quotes
+        return True
+    
+    def refine_user_query(self, user_input: str) -> str:
+        """
+        Refine a user query to make it more precise for command generation.
+        
+        Args:
+            user_input: Original user query
+            
+        Returns:
+            str: Refined user query
+        """
+        if not self.refine_queries:
+            return user_input
+            
+        self.log_debug(f"Refining user query: {user_input}")
+        
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        # Create a system message for query refinement
+        system_message = """You are an AI assistant that refines user queries into clear, specific instructions.
+        Your task is to clarify ambiguous requests and add necessary context.
+        Do NOT generate commands directly - just improve the query for clarity.
+        Keep the refined query brief and focused.
+        """
+        
+        # Create the messages for the API call
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Refine this query for a command-line assistant: '{user_input}'\n\nDirectory Information:\n{dir_context}"}
+        ]
+        
+        try:
+            # Call OpenAI API with the request
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.3
+            )
+            
+            # Extract the refined query
+            refined_query = response.choices[0].message.content.strip()
+            self.log_debug(f"Refined query: {refined_query}")
+            
+            # If the refinement significantly changes the query, let the user know
+            if len(refined_query) > len(user_input) * 1.5 or len(refined_query) < len(user_input) * 0.5:
+                console.print(f"[dim]Refined query: {refined_query}[/dim]")
+                
+            return refined_query
+            
+        except Exception as e:
+            # Log error but continue with original query
+            self.log_debug(f"Error refining query: {str(e)}")
+            return user_input
 
 
 class MemoryManager:
@@ -724,11 +1359,63 @@ class MemoryManager:
         self.conn = sqlite3.connect(DB_PATH)
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
+        self.setup_tables()
     
     def __del__(self):
         """Close database connection when object is destroyed."""
         if hasattr(self, 'conn') and self.conn:
             self.conn.close()
+    
+    def setup_tables(self):
+        """Set up the database tables for memory storage."""
+        # Create memory table for command execution results
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            task TEXT,
+            commands TEXT,
+            results TEXT,
+            success INTEGER
+        )
+        ''')
+        
+        # Create session table
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS session (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            current_task TEXT
+        )
+        ''')
+        
+        # Create conversation_log table to track all interactions
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            session_id TEXT,
+            type TEXT,
+            content TEXT,
+            metadata TEXT
+        )
+        ''')
+        
+        # Create entities table to track specific items (files, directories, etc.)
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            entity_type TEXT,
+            name TEXT,
+            path TEXT,
+            action TEXT,
+            conversation_id INTEGER,
+            FOREIGN KEY(conversation_id) REFERENCES conversation_log(id)
+        )
+        ''')
+        
+        self.conn.commit()
     
     def store_task(self, task: str):
         """
@@ -746,9 +1433,18 @@ class MemoryManager:
             "INSERT INTO session (timestamp, current_task) VALUES (?, ?)",
             (timestamp, task)
         )
+        
+        # Generate a unique session ID
+        session_id = f"session_{int(datetime.now().timestamp())}"
+        
+        # Log the user query in conversation_log
+        self.log_conversation("user_query", task, session_id=session_id)
+        
         self.conn.commit()
+        
+        return session_id
     
-    def store_command_result(self, task: str, command: str, result: str, success: bool):
+    def store_command_result(self, task: str, command: str, result: str, success: bool, session_id: str = None):
         """
         Store a command execution result in memory.
         
@@ -757,6 +1453,7 @@ class MemoryManager:
             command: Executed command
             result: Command output
             success: Whether command succeeded
+            session_id: Current session ID
         """
         timestamp = datetime.now().isoformat()
         
@@ -765,6 +1462,15 @@ class MemoryManager:
             "INSERT INTO memory (timestamp, task, commands, results, success) VALUES (?, ?, ?, ?, ?)",
             (timestamp, task, command, result, 1 if success else 0)
         )
+        
+        # Log the command in conversation_log
+        cmd_log_id = self.log_conversation("command", command, session_id=session_id, metadata=json.dumps({"success": success}))
+        
+        # Log the result in conversation_log
+        self.log_conversation("result", result, session_id=session_id, metadata=json.dumps({"success": success}))
+        
+        # Extract and store entities from the command and result
+        self.extract_and_store_entities(command, result, cmd_log_id)
         
         # Prune old entries if we exceed the maximum
         self.cursor.execute("SELECT COUNT(*) FROM memory")
@@ -778,6 +1484,214 @@ class MemoryManager:
             )
         
         self.conn.commit()
+    
+    def log_conversation(self, entry_type: str, content: str, session_id: str = None, metadata: str = None) -> int:
+        """
+        Log an entry in the conversation history.
+        
+        Args:
+            entry_type: Type of entry (user_query, command, result, system_message)
+            content: Content of the entry
+            session_id: Session identifier
+            metadata: Additional metadata as JSON string
+            
+        Returns:
+            int: ID of the inserted log entry
+        """
+        timestamp = datetime.now().isoformat()
+        
+        # If no session ID provided, try to get it from the current session
+        if not session_id:
+            self.cursor.execute("SELECT id FROM session LIMIT 1")
+            session_row = self.cursor.fetchone()
+            if session_row:
+                session_id = f"session_{session_row[0]}"
+            else:
+                session_id = f"session_{int(datetime.now().timestamp())}"
+        
+        # Insert the log entry
+        self.cursor.execute(
+            "INSERT INTO conversation_log (timestamp, session_id, type, content, metadata) VALUES (?, ?, ?, ?, ?)",
+            (timestamp, session_id, entry_type, content, metadata)
+        )
+        
+        # Get the ID of the inserted row
+        log_id = self.cursor.lastrowid
+        
+        self.conn.commit()
+        return log_id
+    
+    def extract_and_store_entities(self, command: str, result: str, conversation_id: int):
+        """
+        Extract and store entities (files, directories) referenced in commands and results.
+        
+        Args:
+            command: Executed command
+            result: Command output
+            conversation_id: ID of the associated conversation log entry
+        """
+        # Extract file operations (create, delete, modify)
+        file_patterns = {
+            'create': [
+                r'touch\s+([^\s;|&]+)',  # touch file.txt
+                r'>\s*([^\s;|&]+)',      # > file.txt
+                r'echo\s+.*>\s*([^\s;|&]+)',  # echo content > file.txt
+                r'nano\s+([^\s;|&]+)',   # nano file.txt
+                r'vim\s+([^\s;|&]+)',    # vim file.txt
+                r'mkdir\s+([^\s;|&]+)',  # mkdir directory
+                r'mkdir\s+-p\s+([^\s;|&]+)'  # mkdir -p directory/subdirectory
+            ],
+            'delete': [
+                r'rm\s+([^\s;|&]+)',     # rm file.txt
+                r'rm\s+-r\s+([^\s;|&]+)',  # rm -r directory
+                r'rm\s+-rf\s+([^\s;|&]+)',  # rm -rf directory
+                r'rmdir\s+([^\s;|&]+)'   # rmdir directory
+            ],
+            'modify': [
+                r'mv\s+\S+\s+([^\s;|&]+)',  # mv source destination
+                r'cp\s+\S+\s+([^\s;|&]+)'   # cp source destination
+            ]
+        }
+        
+        timestamp = datetime.now().isoformat()
+        entities_to_store = []
+        
+        # Process each action type
+        for action, patterns in file_patterns.items():
+            for pattern in patterns:
+                matches = re.finditer(pattern, command)
+                for match in matches:
+                    entity_name = match.group(1)
+                    
+                    # Skip if it's a flag (starts with - or --)
+                    if entity_name.startswith('-'):
+                        continue
+                    
+                    # Determine if it's a file or directory
+                    entity_type = 'directory' if ('mkdir' in command and entity_name in command) or \
+                                                ('rmdir' in command and entity_name in command) else 'file'
+                    
+                    # Get absolute path if relative
+                    path = entity_name
+                    if not os.path.isabs(entity_name):
+                        path = os.path.abspath(os.path.join(os.getcwd(), entity_name))
+                    
+                    entities_to_store.append((timestamp, entity_type, entity_name, path, action, conversation_id))
+        
+        # Store all extracted entities
+        for entity in entities_to_store:
+            self.cursor.execute(
+                "INSERT INTO entities (timestamp, entity_type, name, path, action, conversation_id) VALUES (?, ?, ?, ?, ?, ?)",
+                entity
+            )
+        
+        self.conn.commit()
+    
+    def get_conversation_history(self, limit: int = 20, session_id: str = None) -> List[Dict]:
+        """
+        Get recent conversation history.
+        
+        Args:
+            limit: Maximum number of entries to retrieve
+            session_id: Optional session ID to filter by
+            
+        Returns:
+            List[Dict]: Recent conversation entries
+        """
+        if session_id:
+            self.cursor.execute(
+                "SELECT * FROM conversation_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit)
+            )
+        else:
+            self.cursor.execute(
+                "SELECT * FROM conversation_log ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+        
+        history = []
+        for row in self.cursor.fetchall():
+            history.append(dict(row))
+        
+        return history
+    
+    def get_entity_history(self, entity_name: str = None, entity_type: str = None, action: str = None) -> List[Dict]:
+        """
+        Get history of operations on a specific entity.
+        
+        Args:
+            entity_name: Optional name of the entity to filter by
+            entity_type: Optional type of entity (file, directory)
+            action: Optional action (create, delete, modify)
+            
+        Returns:
+            List[Dict]: Matching entity operations
+        """
+        query = "SELECT * FROM entities WHERE 1=1"
+        params = []
+        
+        if entity_name:
+            query += " AND name = ?"
+            params.append(entity_name)
+        
+        if entity_type:
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        
+        if action:
+            query += " AND action = ?"
+            params.append(action)
+        
+        query += " ORDER BY timestamp DESC"
+        
+        self.cursor.execute(query, params)
+        
+        entities = []
+        for row in self.cursor.fetchall():
+            entities.append(dict(row))
+        
+        return entities
+    
+    def search_context(self, query: str, include_entities: bool = True, limit: int = 10) -> Dict:
+        """
+        Search through conversation history and entities for relevant context.
+        
+        Args:
+            query: Search terms or question
+            include_entities: Whether to include entity information
+            limit: Maximum number of entries to retrieve
+            
+        Returns:
+            Dict: Context information with conversation history and entities
+        """
+        search_terms = f"%{query}%"
+        
+        # Search in conversation log
+        self.cursor.execute(
+            "SELECT * FROM conversation_log WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
+            (search_terms, limit)
+        )
+        
+        conversations = []
+        for row in self.cursor.fetchall():
+            conversations.append(dict(row))
+        
+        result = {"conversations": conversations}
+        
+        # Optionally search in entities
+        if include_entities:
+            self.cursor.execute(
+                "SELECT * FROM entities WHERE name LIKE ? OR path LIKE ? ORDER BY timestamp DESC LIMIT ?",
+                (search_terms, search_terms, limit)
+            )
+            
+            entities = []
+            for row in self.cursor.fetchall():
+                entities.append(dict(row))
+            
+            result["entities"] = entities
+        
+        return result
     
     def get_recent_memories(self, limit: int = 5) -> List[Dict]:
         """
@@ -851,6 +1765,34 @@ def parse_args():
         action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--max-plan-iterations",
+        type=int,
+        default=1,
+        help="Maximum number of iterations for plan verification"
+    )
+    parser.add_argument(
+        "--no-direct-execution",
+        action="store_true",
+        help="Disable direct execution of shell commands"
+    )
+    parser.add_argument(
+        "--no-refine-queries",
+        action="store_true",
+        help="Disable query refinement via API"
+    )
+    parser.add_argument(
+        "--max-logs",
+        type=int,
+        default=MAX_LOG_FILES,
+        help="Maximum number of log files to keep"
+    )
+    parser.add_argument(
+        "--logs-dir",
+        type=str,
+        default=str(LOGS_FOLDER),
+        help="Directory where conversation logs are stored"
+    )
     return parser.parse_args()
 
 
@@ -858,6 +1800,22 @@ if __name__ == "__main__":
     # Parse command-line arguments
     args = parse_args()
     
+    # Create a custom FileLogger with the user-specified settings
+    custom_logger = FileLogger(
+        logs_folder=Path(args.logs_dir),
+        max_log_files=args.max_logs
+    )
+    
     # Initialize and run the AI Terminal
-    terminal = AITerminal(mode=args.mode, debug=args.debug)
+    terminal = AITerminal(
+        mode=args.mode, 
+        debug=args.debug, 
+        max_plan_iterations=args.max_plan_iterations,
+        direct_execution=not args.no_direct_execution,
+        refine_queries=not args.no_refine_queries
+    )
+    
+    # Replace the default logger with our custom one
+    terminal.logger = custom_logger
+    
     terminal.run() 
