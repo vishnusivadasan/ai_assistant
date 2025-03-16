@@ -461,6 +461,7 @@ class AITerminal:
         - **Plan Verification**: Complex tasks go through plan verification and refinement (up to {max_iterations} iterations)
         - **Conversation Logging**: All interactions are logged to plain text files in {logs_folder}
         - **Full Output Capture**: Complete command output is captured and can be viewed with 'show output'
+        - **Content Creation**: Can generate reports, articles, and other content with proper formatting
         
         ## Context Awareness
         The AI Terminal remembers your previous commands, their results, and conversations.
@@ -469,6 +470,19 @@ class AITerminal:
         - "What was the output of the last command?"
         - "Show me what you've done so far"
         - "What command did you use to do X?"
+        
+        ## Content Creation Capabilities
+        AI Terminal can now create content like reports, articles, and documentation.
+        For example, you can ask:
+        - "Write a report on the history of India from 2010 to 2020"
+        - "Create a detailed tutorial on how to use Docker"
+        - "Generate a summary of recent AI advancements"
+        
+        The system will:
+        1. Generate a structured outline
+        2. Let you approve the outline
+        3. Create comprehensive content
+        4. Allow you to save the content as a Markdown file
         
         ## Safety Features
         - Commands are analyzed for potential risks using both rule-based checks and AI
@@ -480,6 +494,7 @@ class AITerminal:
         - "Install Node.js using Homebrew"
         - "Create a new React project in ~/Projects"
         - "Check disk usage and show the largest directories"
+        - "Write a detailed report on renewable energy sources"
         - "ls -la" (direct execution)
         - "What was the last command you ran?" (context query)
         """
@@ -578,14 +593,34 @@ class AITerminal:
         Returns:
             bool: True if the task appears complex, False otherwise
         """
-        # Use OpenAI to determine if this is a complex task requiring multiple steps
+        # Quick pattern-based check for obviously complex tasks
+        complex_patterns = [
+            r'(write|create|generate|prepare).*report',
+            r'(write|create|generate|prepare).*article',
+            r'(write|create|generate|prepare).*document',
+            r'(write|create|generate|prepare).*summary',
+            r'(write|create|generate|prepare).*analysis',
+            r'(research|analyze).*and.*(write|create|report)',
+            r'multiple (steps|sections|parts)',
+            r'(plan|roadmap|strategy) for',
+            r'history of',
+            r'compare.*and.*contrast'
+        ]
         
+        # Check for complex patterns first (faster than API call)
+        for pattern in complex_patterns:
+            if re.search(pattern, user_input.lower()):
+                self.log_debug(f"Complex task detected via pattern matching: {pattern}")
+                self.logger.log_system_message(f"Complex task detected via pattern: {pattern}")
+                return True
+                
+        # Use OpenAI to determine if this is a complex task requiring multiple steps
         # Get directory context
         dir_context = self.get_directory_context()
         
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that determines if a task requires multiple shell commands to complete. Respond with 'yes' or 'no'."},
-            {"role": "user", "content": f"Does this task require multiple shell commands to complete? Task: {user_input}\n\nDirectory Information:\n{dir_context}"}
+            {"role": "system", "content": "You are a helpful assistant that determines if a task requires multiple steps or shell commands to complete, or if it requires non-command line work like content creation. For content creation, research, writing, or analysis tasks, always respond with 'yes'. For simple file operations or single commands, respond with 'no'. Respond with 'yes' or 'no' only."},
+            {"role": "user", "content": f"Does this task require multiple shell commands to complete or involve content creation/writing? Task: {user_input}\n\nDirectory Information:\n{dir_context}"}
         ]
         
         self.log_debug(f"Checking complexity of task: {user_input}")
@@ -1062,6 +1097,24 @@ class AITerminal:
         console.print("[bold blue]Agent Mode activated[/bold blue]")
         console.print(f"Task: [bold]{task}[/bold]")
         
+        # Check if this is a content creation task
+        content_creation_patterns = [
+            r'(write|create|generate|prepare).*report',
+            r'(write|create|generate|prepare).*article',
+            r'(write|create|generate|prepare).*document',
+            r'(write|create|generate|prepare).*summary',
+            r'(write|create|generate|prepare).*analysis',
+            r'history of',
+            r'research (on|about)',
+        ]
+        
+        is_content_task = any(re.search(pattern, task.lower()) for pattern in content_creation_patterns)
+        
+        if is_content_task:
+            console.print("[bold blue]Content creation task detected. Generating content...[/bold blue]")
+            self.handle_content_creation_task(task)
+            return
+        
         # Get initial step-by-step plan from OpenAI
         plan = self.generate_plan(task)
         
@@ -1106,6 +1159,182 @@ class AITerminal:
                         break
         
         console.print("\n[bold green]Plan execution completed.[/bold green]")
+    
+    def handle_content_creation_task(self, task: str):
+        """
+        Handle content creation tasks like writing reports, articles, etc.
+        
+        Args:
+            task: The content creation task description
+        """
+        self.logger.log_system_message(f"Creating content for task: {task}")
+        console.print("[blue]Planning content structure...[/blue]")
+        
+        # Generate content outline first
+        outline = self.generate_content_outline(task)
+        
+        # Display the outline to the user
+        console.print("\n[bold blue]Content Outline:[/bold blue]")
+        console.print(Markdown(outline))
+        
+        # Ask for confirmation before proceeding with full content generation
+        if self.mode == "manual" and not Confirm.ask("Generate content based on this outline?", default=True):
+            console.print("[blue]Content generation cancelled.[/blue]")
+            return
+        
+        # Generate the full content
+        console.print("\n[blue]Generating content... (this may take a few moments)[/blue]")
+        content = self.generate_full_content(task, outline)
+        
+        # Display the content to the user
+        console.print("\n[bold blue]Generated Content:[/bold blue]")
+        console.print(Markdown(content))
+        
+        # Log the generated content
+        self.logger.log_system_message("Content generated successfully")
+        
+        # Ask if user wants to save the content to a file
+        if Confirm.ask("Would you like to save this content to a file?", default=True):
+            filename = self.get_filename_for_content(task)
+            self.save_content_to_file(content, filename)
+    
+    def generate_content_outline(self, task: str) -> str:
+        """
+        Generate an outline for content creation tasks.
+        
+        Args:
+            task: Content creation task description
+            
+        Returns:
+            str: Content outline in markdown format
+        """
+        system_message = """You are an AI assistant that creates detailed outlines for content.
+        Create a comprehensive outline for the requested content.
+        Format your outline in Markdown with clear sections and subsections.
+        Be thorough but concise in your outline structure.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Create a detailed outline for the following content task: {task}"}
+        ]
+        
+        try:
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.3
+            )
+            
+            outline = response.choices[0].message.content
+            self.logger.log_system_message("Content outline generated")
+            return outline
+            
+        except Exception as e:
+            error_msg = f"Error generating content outline: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(error_msg)
+            return "# Error in Outline Generation\n\nFailed to create outline."
+    
+    def generate_full_content(self, task: str, outline: str) -> str:
+        """
+        Generate full content based on task and outline.
+        
+        Args:
+            task: Content creation task description
+            outline: Content outline
+            
+        Returns:
+            str: Generated content in markdown format
+        """
+        system_message = """You are an AI assistant that creates detailed, well-researched content.
+        Create comprehensive content based on the provided task and outline.
+        Make sure to follow the outline structure but expand with detailed information.
+        Format your response using Markdown for better readability.
+        Include proper headings, subheadings, bullet points, and formatting.
+        Aim to be informative, accurate, and well-structured.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Create detailed content for the following task: {task}\n\nUse this outline as the structure:\n\n{outline}"}
+        ]
+        
+        try:
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.3
+            )
+            
+            content = response.choices[0].message.content
+            self.logger.log_system_message("Full content generated")
+            return content
+            
+        except Exception as e:
+            error_msg = f"Error generating full content: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(error_msg)
+            return "# Error in Content Generation\n\nFailed to create content."
+    
+    def get_filename_for_content(self, task: str) -> str:
+        """
+        Generate a suitable filename for the content.
+        
+        Args:
+            task: The content task
+            
+        Returns:
+            str: A suitable filename
+        """
+        # Sanitize task to create filename
+        sanitized = re.sub(r'[^\w\s-]', '', task.lower())
+        sanitized = re.sub(r'[\s-]+', '_', sanitized)
+        base_filename = sanitized[:50]  # Limit length
+        
+        # Add timestamp to ensure uniqueness
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{base_filename}_{timestamp}.md"
+        
+        # Allow user to modify the filename
+        user_filename = Prompt.ask("[bold]Enter filename to save content[/bold]", default=filename)
+        
+        # Ensure .md extension
+        if not user_filename.endswith('.md'):
+            user_filename += '.md'
+            
+        return user_filename
+    
+    def save_content_to_file(self, content: str, filename: str):
+        """
+        Save generated content to a file.
+        
+        Args:
+            content: The content to save
+            filename: Filename to save to
+        """
+        try:
+            # Create full path
+            file_path = os.path.join(os.getcwd(), filename)
+            
+            # Write content to file
+            with open(file_path, 'w') as f:
+                f.write(content)
+                
+            console.print(f"[bold green]Content saved to [/bold green][bold cyan]{file_path}[/bold cyan]")
+            self.logger.log_system_message(f"Content saved to file: {file_path}")
+            
+            # Execute a command to show the file was created
+            self.execute_command(f"ls -la {shlex.quote(file_path)}")
+            
+        except Exception as e:
+            error_msg = f"Error saving content to file: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(error_msg)
     
     def generate_plan(self, task: str) -> Dict:
         """
