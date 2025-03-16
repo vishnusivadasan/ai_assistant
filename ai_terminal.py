@@ -145,10 +145,7 @@ class FileLogger:
             result: The command output
             success: Whether the command succeeded
         """
-        # Truncate very long results
-        if len(result) > 2000:
-            result = result[:1997] + "..."
-            
+        # Remove truncation to log the full output
         with open(self.log_file, 'a') as f:
             status = "SUCCESS" if success else "FAILURE"
             f.write(f"\nRESULT [{datetime.now().strftime('%H:%M:%S')}] ({status}):\n")
@@ -203,7 +200,7 @@ class AITerminal:
     """AI-Powered Terminal application that converts natural language to shell commands."""
     
     def __init__(self, mode: str = "manual", debug: bool = False, max_plan_iterations: int = 5, 
-                 direct_execution: bool = True, refine_queries: bool = True):
+                 direct_execution: bool = True, refine_queries: bool = True, logger=None):
         """
         Initialize the AI Terminal.
         
@@ -213,17 +210,25 @@ class AITerminal:
             max_plan_iterations: Maximum number of iterations for plan verification
             direct_execution: Enable direct execution of shell commands if detected
             refine_queries: Enable query refinement via API
+            logger: FileLogger instance, if None a default one will be created
         """
         self.mode = mode
         self.debug = debug
         self.memory = MemoryManager()  # Keep for backward compatibility
-        self.logger = FileLogger()  # New file-based logger
         self.shell = os.environ.get("SHELL", "/bin/zsh")
         self.command_history = []
         self.max_plan_iterations = max_plan_iterations
         self.direct_execution = direct_execution
         self.refine_queries = refine_queries
         self.current_task = None
+        
+        # Set up logger
+        if logger is None:
+            self.logger = FileLogger()  # Create default file-based logger
+            print("Created default logger")
+        else:
+            self.logger = logger
+            print(f"Using provided logger with logs folder: {self.logger.logs_folder}")
         
         # Check for API key
         if not openai.api_key:
@@ -299,6 +304,11 @@ class AITerminal:
                     self._open_logs_directory()
                     continue
                 
+                # Check for command to view last command output
+                if user_input.lower() in ("show output", "view output", "show last output", "view last output"):
+                    self._show_last_command_output()
+                    continue
+                
                 # Process the user's request
                 self.process_request(user_input)
                 
@@ -357,6 +367,68 @@ class AITerminal:
             console.print(f"[bold red]Error opening logs directory: {str(e)}[/bold red]")
             self.logger.log_system_message(f"Error opening logs directory: {str(e)}")
     
+    def _show_last_command_output(self):
+        """Display the full output of the last executed command."""
+        try:
+            # Read the log file to find the last command and result
+            log_content = self.logger.get_conversation_history()
+            
+            # Split the log content into sections
+            sections = log_content.split("\nCOMMAND [")
+            
+            if len(sections) > 1:
+                # Get the last command section
+                last_command_section = "\nCOMMAND [" + sections[-1]
+                
+                # Further split to get just the result
+                result_parts = last_command_section.split("\nRESULT [")
+                
+                if len(result_parts) > 1:
+                    result_section = "\nRESULT [" + result_parts[-1]
+                    
+                    # Extract the command and result content
+                    command_content = result_parts[0].split("]: ", 1)[1].strip()
+                    
+                    # Get the result content (excluding the timestamp and status)
+                    result_lines = result_section.split("\n")
+                    status_line = result_lines[0]  # Contains timestamp and status
+                    result_content = "\n".join(result_lines[1:])
+                    
+                    # Get status information
+                    status = "SUCCESS" if "SUCCESS" in status_line else "FAILURE"
+                    status_color = "green" if status == "SUCCESS" else "red"
+                    
+                    # Display in a nice panel with clear formatting
+                    console.print("\n[bold blue]Complete Output of Last Command:[/bold blue]")
+                    
+                    # Command panel
+                    console.print(Panel(
+                        Syntax(command_content, "bash", theme="monokai", line_numbers=False),
+                        title="[bold yellow]Command[/bold yellow]",
+                        expand=False
+                    ))
+                    
+                    # Status line
+                    console.print(f"[bold {status_color}]{status}[/bold {status_color}]")
+                    
+                    # Output panel - use a larger panel for the output
+                    console.print(Panel(
+                        result_content,
+                        title="[bold cyan]Complete Output[/bold cyan]",
+                        expand=False,
+                        width=min(console.width, 120)
+                    ))
+                    
+                    self.logger.log_system_message("User viewed the full output of the last command")
+                else:
+                    console.print("[yellow]No command results found in the log.[/yellow]")
+            else:
+                console.print("[yellow]No previous commands found in the log.[/yellow]")
+                
+        except Exception as e:
+            console.print(f"[bold red]Error retrieving last command output: {str(e)}[/bold red]")
+            self.logger.log_system_message(f"Error retrieving last command output: {str(e)}")
+    
     def show_help(self):
         """Show help information."""
         help_text = """
@@ -369,6 +441,7 @@ class AITerminal:
         - `show log` or `view log`: Display the current conversation log
         - `show logs` or `list logs`: List all available conversation logs
         - `open logs` or `open logs folder`: Open the logs directory in your file explorer
+        - `show output` or `view output`: Display the full output of the last executed command
         
         ## Current Mode
         - Current mode: {mode}
@@ -387,6 +460,7 @@ class AITerminal:
         - **Query Refinement**: When enabled, user inputs are refined via API for better clarity
         - **Plan Verification**: Complex tasks go through plan verification and refinement (up to {max_iterations} iterations)
         - **Conversation Logging**: All interactions are logged to plain text files in {logs_folder}
+        - **Full Output Capture**: Complete command output is captured and can be viewed with 'show output'
         
         ## Context Awareness
         The AI Terminal remembers your previous commands, their results, and conversations.
@@ -780,60 +854,108 @@ class AITerminal:
             # Add command to history
             self.command_history.append(command)
             
-            # Create a process
-            start_time = time.time()
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=True,
-                executable=self.shell,
-                text=True
-            )
+            # First try to determine if this is a simple command that will have short output
+            # If so, use subprocess.run which is more reliable for capturing all output
+            is_complex_command = ('|' in command or '>' in command or 
+                                 any(cmd in command for cmd in ['find', 'grep', 'awk', 'sort']))
+            is_interactive = any(cmd in command for cmd in ['vim', 'nano', 'less', 'more', 'top'])
             
-            # Create a status indicator
-            with console.status("[bold green]Executing command...[/bold green]") as status:
-                # Poll for output while process is running
-                output_lines = []
-                error_lines = []
+            # Start timing
+            start_time = time.time()
+            
+            if not is_complex_command and not is_interactive:
+                # Use subprocess.run for simpler commands
+                with console.status("[bold green]Executing command...[/bold green]"):
+                    result = subprocess.run(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        shell=True,
+                        executable=self.shell,
+                        text=True
+                    )
                 
-                while process.poll() is None:
-                    # Read any new output
-                    stdout_line = process.stdout.readline()
-                    if stdout_line:
-                        output_lines.append(stdout_line)
-                        console.print(stdout_line, end="")
-                    
-                    # Read any new errors
-                    stderr_line = process.stderr.readline()
-                    if stderr_line:
-                        error_lines.append(stderr_line)
-                        console.print(f"[red]{stderr_line}[/red]", end="")
-                    
-                    # Avoid high CPU usage
-                    time.sleep(0.01)
+                output = result.stdout
+                errors = result.stderr
+                success = result.returncode == 0
                 
-                # Get any remaining output
-                stdout, stderr = process.communicate()
-                if stdout:
-                    output_lines.append(stdout)
-                    console.print(stdout, end="")
-                if stderr:
-                    error_lines.append(stderr)
-                    console.print(f"[red]{stderr}[/red]", end="")
+                # Print a separator line to make the result more visible
+                console.print("\n" + "-" * 50)
+                
+                # Display captured output
+                if output.strip():
+                    console.print("\n[bold cyan]Command Output:[/bold cyan]")
+                    console.print(output)
+                    
+                if errors.strip():
+                    console.print("\n[bold red]Command Errors:[/bold red]")
+                    console.print(errors)
+                
+                # Print a separator line to make the end of output clear
+                console.print("-" * 50)
+            
+            else:
+                # Use interactive approach for complex commands
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=True,
+                    executable=self.shell,
+                    text=True,
+                    bufsize=1  # Line buffered
+                )
+                
+                # Create a status indicator
+                with console.status("[bold green]Executing command...[/bold green]") as status:
+                    # Poll for output while process is running
+                    output_lines = []
+                    error_lines = []
+                    
+                    while process.poll() is None:
+                        # Read any new output
+                        stdout_line = process.stdout.readline()
+                        if stdout_line:
+                            output_lines.append(stdout_line)
+                            console.print(stdout_line, end="", highlight=False)
+                        
+                        # Read any new errors
+                        stderr_line = process.stderr.readline()
+                        if stderr_line:
+                            error_lines.append(stderr_line)
+                            console.print(f"[red]{stderr_line}[/red]", end="", highlight=False)
+                        
+                        # Avoid high CPU usage
+                        time.sleep(0.01)
+                    
+                    # Get any remaining output
+                    stdout, stderr = process.communicate()
+                    if stdout:
+                        output_lines.append(stdout)
+                        console.print(stdout, end="", highlight=False)
+                    if stderr:
+                        error_lines.append(stderr)
+                        console.print(f"[red]{stderr}[/red]", end="", highlight=False)
+                
+                # Combine output and errors
+                output = "".join(output_lines)
+                errors = "".join(error_lines)
+                success = process.returncode == 0
+                
+                # Print separator and output summary for complex commands
+                console.print("\n" + "-" * 50)
+                console.print("[bold cyan]Output shown above - captured and logged[/bold cyan]")
+                console.print("-" * 50)
+            
+            combined_output = output + errors
             
             # Calculate execution time
             execution_time = time.time() - start_time
             
-            # Combine output and errors
-            output = "".join(output_lines)
-            errors = "".join(error_lines)
-            combined_output = output + errors
-            
-            # Determine success based on exit code
-            success = process.returncode == 0
+            # Show execution status
             status_str = "[bold green]Success[/bold green]" if success else "[bold red]Failed[/bold red]"
-            console.print(f"\n{status_str} (Exit code: {process.returncode}, Time: {execution_time:.2f}s)")
+            console.print(f"\n{status_str} (Exit code: {0 if success else 1}, Time: {execution_time:.2f}s)")
+            console.print(f"[dim]Full output captured and logged to: {self.logger.log_file}[/dim]")
             
             # Log the result
             self.logger.log_result(combined_output, success)
@@ -1313,17 +1435,22 @@ Please verify if this plan is sound and complete for accomplishing the task."""
         # Get directory context
         dir_context = self.get_directory_context()
         
+        # Get conversation history for additional context
+        conversation_history = self.logger.get_conversation_history()
+        self.logger.log_system_message("Using conversation history for query refinement")
+        
         # Create a system message for query refinement
         system_message = """You are an AI assistant that refines user queries into clear, specific instructions.
         Your task is to clarify ambiguous requests and add necessary context.
         Do NOT generate commands directly - just improve the query for clarity.
         Keep the refined query brief and focused.
+        Consider the conversation history to understand the user's current context and needs.
         """
         
         # Create the messages for the API call
         messages = [
             {"role": "system", "content": system_message},
-            {"role": "user", "content": f"Refine this query for a command-line assistant: '{user_input}'\n\nDirectory Information:\n{dir_context}"}
+            {"role": "user", "content": f"Refine this query for a command-line assistant: '{user_input}'\n\nDirectory Information:\n{dir_context}\n\nRecent Conversation History:\n{conversation_history}"}
         ]
         
         try:
@@ -1800,6 +1927,10 @@ if __name__ == "__main__":
     # Parse command-line arguments
     args = parse_args()
     
+    # Print configuration for debugging
+    print(f"Using logs directory: {args.logs_dir}")
+    print(f"Maximum log files to keep: {args.max_logs}")
+    
     # Create a custom FileLogger with the user-specified settings
     custom_logger = FileLogger(
         logs_folder=Path(args.logs_dir),
@@ -1812,10 +1943,11 @@ if __name__ == "__main__":
         debug=args.debug, 
         max_plan_iterations=args.max_plan_iterations,
         direct_execution=not args.no_direct_execution,
-        refine_queries=not args.no_refine_queries
+        refine_queries=not args.no_refine_queries,
+        logger=custom_logger
     )
     
-    # Replace the default logger with our custom one
-    terminal.logger = custom_logger
+    # Print successful logger setup confirmation
+    print(f"AI Terminal initialized with custom logger at: {terminal.logger.logs_folder}")
     
     terminal.run() 
