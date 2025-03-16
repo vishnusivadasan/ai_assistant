@@ -228,7 +228,9 @@ class AITerminal:
         self.log_debug(f"Checking complexity of task: {user_input}")
         
         try:
-            response = openai.chat.completions.create(
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
                 max_tokens=5,
@@ -277,7 +279,9 @@ class AITerminal:
         self.log_debug(f"With directory context: {dir_context}")
         
         try:
-            response = openai.chat.completions.create(
+            # Show thinking animation while waiting for API response
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
                 temperature=0.2
@@ -391,8 +395,9 @@ class AITerminal:
                 {"role": "user", "content": f"Assess this command: {command}\n\nDirectory Information:\n{dir_context}"}
             ]
             
-            # Get response from OpenAI
-            response = openai.chat.completions.create(
+            # Get response from OpenAI with animation
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
                 max_tokens=10,
@@ -531,7 +536,9 @@ class AITerminal:
         ]
         
         try:
-            response = openai.chat.completions.create(
+            # Show thinking animation while waiting for API response
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
                 temperature=0.2,
@@ -597,7 +604,9 @@ class AITerminal:
         ]
         
         try:
-            response = openai.chat.completions.create(
+            # Show thinking animation while creating the plan
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
                 temperature=0.2,
@@ -680,6 +689,31 @@ class AITerminal:
         except Exception as e:
             self.log_debug(f"Error getting directory context: {str(e)}")
             return "Unable to determine directory context."
+            
+    def call_api_with_animation(self, api_function, **kwargs):
+        """
+        Call an API with a loading animation using Rich.
+        
+        Args:
+            api_function: Function reference to the API call
+            **kwargs: Keyword arguments to pass to the API function
+            
+        Returns:
+            The API response
+        """
+        spinner_text = "Thinking..."
+        spinner_style = "bold blue"
+        
+        # Show a spinner animation while waiting for the API response
+        with console.status(f"[{spinner_style}]{spinner_text}[/{spinner_style}]", spinner="dots") as status:
+            try:
+                # Call the API function with the provided arguments
+                response = api_function(**kwargs)
+                return response
+            except Exception as e:
+                # Log any errors but don't display to user yet (caller will handle that)
+                self.log_debug(f"API call error: {str(e)}")
+                raise
 
 
 class MemoryManager:
