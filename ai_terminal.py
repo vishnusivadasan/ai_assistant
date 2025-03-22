@@ -857,7 +857,7 @@ class AITerminal:
             self.logger.log_system_message(f"Error: {error_msg}")
             return ""
     
-    def execute_with_confirmation(self, command: str, context: str = "", is_dangerous: bool = False):
+    def execute_with_confirmation(self, command: str, context: str = "", is_dangerous: bool = False) -> Tuple[str, bool]:
         """
         Execute a command with user confirmation only if the command is potentially dangerous.
         
@@ -865,10 +865,13 @@ class AITerminal:
             command: Shell command to execute
             context: Optional context about the command
             is_dangerous: Whether the command is potentially dangerous
+            
+        Returns:
+            Tuple[str, bool]: The command output and a boolean indicating success
         """
         if not command:
             console.print("[bold red]No valid command generated.[/bold red]")
-            return
+            return "", False
         
         # Show the command that will be executed
         console.print("\n[bold blue]Generated Command:[/bold blue]")
@@ -891,7 +894,10 @@ class AITerminal:
             console.print("[dim]Command appears safe, executing automatically...[/dim]")
         
         if execute:
-            self.execute_command(command)
+            output, success = self.execute_command(command)
+            return output, success
+        else:
+            return "Command execution cancelled by user.", False
     
     def is_dangerous_command(self, command: str) -> bool:
         """
@@ -1239,53 +1245,42 @@ class AITerminal:
             self.handle_content_creation_task(task)
             return
         
-        # Get initial step-by-step plan from OpenAI
-        plan = self.generate_plan(task)
+        # Get initial high-level plan (without specific commands)
+        high_level_plan = self.generate_high_level_plan(task)
         
-        if not plan or 'steps' not in plan or not plan['steps']:
+        if not high_level_plan or 'steps' not in high_level_plan or not high_level_plan['steps']:
             console.print("[bold red]Failed to generate a plan for this task.[/bold red]")
             return
         
-        # Verify and refine the plan through iterations
-        plan = self.verify_and_refine_plan(task, plan)
-            
         # Group steps by phase
-        analysis_steps = [s for s in plan['steps'] if s.get('phase', '') == 'analysis']
-        planning_steps = [s for s in plan['steps'] if s.get('phase', '') == 'planning']
-        execution_steps = [s for s in plan['steps'] if s.get('phase', '') == 'execution']
-        other_steps = [s for s in plan['steps'] if s.get('phase', '') not in ['analysis', 'planning', 'execution']]
+        analysis_steps = [s for s in high_level_plan['steps'] if s.get('phase', '') == 'analysis']
+        planning_steps = [s for s in high_level_plan['steps'] if s.get('phase', '') == 'planning']
+        execution_steps = [s for s in high_level_plan['steps'] if s.get('phase', '') == 'execution']
+        other_steps = [s for s in high_level_plan['steps'] if s.get('phase', '') not in ['analysis', 'planning', 'execution']]
         
-        # Display the final plan with phases
-        console.print("\n[bold blue]Execution Plan:[/bold blue]")
+        # Display the high-level plan with phases
+        console.print("\n[bold blue]High-Level Execution Plan:[/bold blue]")
         
         # Display phases separately with headers
         if analysis_steps:
             console.print("\n[bold yellow]PHASE 1: ANALYSIS & DISCOVERY[/bold yellow]")
             for i, step in enumerate(analysis_steps, 1):
                 console.print(f"[bold]{i}.[/bold] {step['description']}")
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                console.print()
         
         if planning_steps:
             console.print("\n[bold green]PHASE 2: PLANNING[/bold green]")
             for i, step in enumerate(planning_steps, 1):
                 console.print(f"[bold]{i}.[/bold] {step['description']}")
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                console.print()
         
         if execution_steps:
             console.print("\n[bold blue]PHASE 3: EXECUTION[/bold blue]")
             for i, step in enumerate(execution_steps, 1):
                 console.print(f"[bold]{i}.[/bold] {step['description']}")
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                console.print()
         
         if other_steps:
             console.print("\n[bold purple]OTHER STEPS[/bold purple]")
             for i, step in enumerate(other_steps, 1):
                 console.print(f"[bold]{i}.[/bold] {step['description']}")
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                console.print()
         
         # Ask for confirmation to execute the plan
         if self.mode == "manual" and not Confirm.ask("Execute this plan?", default=True):
@@ -1294,7 +1289,8 @@ class AITerminal:
         
         # Execute each step in the plan - retain original order for execution
         current_phase = None
-        for i, step in enumerate(plan['steps'], 1):
+        
+        for i, step in enumerate(high_level_plan['steps'], 1):
             # Check if we're entering a new phase
             step_phase = step.get('phase', 'other')
             if step_phase != current_phase:
@@ -1307,30 +1303,451 @@ class AITerminal:
                 }.get(step_phase, "[bold purple]OTHER STEPS[/bold purple]")
                 console.print(f"\n{phase_name}")
             
-            console.print(f"\n[bold blue]Step {i}/{len(plan['steps'])}: {step['description']}[/bold blue]")
+            console.print(f"\n[bold blue]Step {i}/{len(high_level_plan['steps'])}: {step['description']}[/bold blue]")
             
-            # Check if the command is dangerous using the API
-            danger_assessment = self.check_command_danger_with_ai(step['command'])
+            # Generate the command for this specific step on the fly
+            command = self.generate_step_command(task, step, high_level_plan['steps'][:i-1])
+            
+            # Display and execute the command
+            console.print(Syntax(command, "bash", theme="monokai", line_numbers=False))
+            
+            # Check if the command is dangerous
+            danger_assessment = self.check_command_danger_with_ai(command)
             
             # Execute with or without confirmation based on mode and danger level
             if self.mode == "manual" or danger_assessment:
-                self.execute_with_confirmation(step['command'], f"Step {i}/{len(plan['steps'])}", is_dangerous=danger_assessment)
+                output, success = self.execute_with_confirmation(command, f"Step {i}/{len(high_level_plan['steps'])}", is_dangerous=danger_assessment)
             else:
-                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-                output, success = self.execute_command(step['command'])
+                output, success = self.execute_command(command)
+            
+            # Verify if the step achieved its intended purpose
+            step_verification = self.verify_step_success(step, command, output, success)
+            
+            if not step_verification['success']:
+                console.print(f"[bold yellow]Step verification: {step_verification['message']}[/bold yellow]")
                 
-                # If a critical step failed, stop execution
-                if not success and step.get('critical', False):
-                    console.print("[bold red]Critical step failed. Stopping execution.[/bold red]")
+                # If a critical step failed or verification failed, ask to fix and continue
+                if (not success or not step_verification['success']) and step.get('critical', False):
+                    console.print("[bold red]Critical step failed or didn't achieve its purpose. Stopping execution.[/bold red]")
                     
-                    # Ask if user wants to try to fix and continue
                     if Confirm.ask("Would you like me to try to fix this and continue?", default=True):
-                        self.handle_error(step['command'], output)
+                        fixed = self.fix_failed_step(step, command, output, step_verification)
+                        if not fixed:
+                            break
                     else:
                         break
+            else:
+                console.print(f"[bold green]Step verification: {step_verification['message']}[/bold green]")
         
         console.print("\n[bold green]Plan execution completed.[/bold green]")
     
+    def generate_high_level_plan(self, task: str) -> Dict:
+        """
+        Generate a high-level plan without specific commands.
+        
+        Args:
+            task: Complex task description
+            
+        Returns:
+            Dict: High-level plan with step descriptions but no commands
+        """
+        system_message = """You are an AI assistant that breaks down complex tasks into a series of high-level steps.
+        Your approach should mirror human-like reasoning by ALWAYS following these phases:
+
+        PHASE 1: ANALYSIS & DISCOVERY
+        - List and examine what exists in the environment
+        - Categorize what you find (file types, structures, patterns)
+        - Understand the current state before making changes
+        
+        PHASE 2: PLANNING
+        - Based on your analysis, develop a thoughtful approach
+        - Consider multiple ways to accomplish the goal
+        - Choose the most appropriate method based on context
+
+        PHASE 3: EXECUTION
+        - Only after thorough analysis, create high-level steps to accomplish the goal
+        - Include verification steps to confirm actions worked as expected
+        
+        Create a step-by-step plan with clear descriptions but DO NOT include specific shell commands.
+        Format your response as JSON with an array of steps, each with:
+        - description: Clear description of what this step should accomplish
+        - expected_outcome: What should happen if this step succeeds
+        - critical: Boolean indicating if this step is critical (failure should stop execution)
+        - phase: String indicating which phase this step belongs to ("analysis", "planning", or "execution")
+        
+        EXAMPLE OF A WELL-STRUCTURED PLAN:
+        ```
+        {
+          "steps": [
+            {
+              "description": "Analyze what files and directories exist in the current location",
+              "expected_outcome": "Understanding of the current file structure and contents",
+              "critical": true,
+              "phase": "analysis"
+            },
+            {
+              "description": "Examine file types to understand what we're working with",
+              "expected_outcome": "Categorization of files by type",
+              "critical": true,
+              "phase": "analysis"
+            },
+            {
+              "description": "Create a directory structure for organization",
+              "expected_outcome": "Creation of needed directories for organization",
+              "critical": true,
+              "phase": "planning"
+            },
+            {
+              "description": "Move image files to the images directory",
+              "expected_outcome": "Image files relocated to the appropriate directory",
+              "critical": true,
+              "phase": "execution"
+            },
+            {
+              "description": "Verify files were moved successfully",
+              "expected_outcome": "Confirmation that files exist in the new location",
+              "critical": false,
+              "phase": "execution"
+            }
+          ]
+        }
+        ```
+        """
+        
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        user_content = f"""Task: {task}
+
+Directory Information:
+{dir_context}
+
+IMPORTANT NOTE: Create a high-level plan without specific commands. Focus on what each step should accomplish.
+
+REMEMBER: Follow the human-like reasoning process by first analyzing what exists, then planning, and finally executing the plan."""
+        
+        try:
+            # Show thinking animation while creating the plan
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            plan = json.loads(response.choices[0].message.content)
+            return plan
+            
+        except Exception as e:
+            console.print(f"[bold red]Error generating high-level plan: {str(e)}[/bold red]")
+            if self.debug:
+                import traceback
+                console.print(traceback.format_exc())
+            return None
+    
+    def generate_step_command(self, task: str, step: Dict, previous_steps: List[Dict]) -> str:
+        """
+        Generate a specific command for a high-level step.
+        
+        Args:
+            task: Original task description
+            step: Current step to generate a command for
+            previous_steps: List of previously executed steps
+            
+        Returns:
+            str: Generated command for this step
+        """
+        system_message = """You are an AI assistant that generates specific shell commands for macOS based on a high-level step description.
+        Given a task, the current step, and information about previous steps, generate the exact shell command that should be executed.
+        
+        IMPORTANT GUIDELINES FOR COMMAND GENERATION:
+        
+        1. DIRECTORY PERSISTENCE: Each command is executed in a separate subprocess, so directory changes with 'cd' DO NOT persist between steps.
+           When working with directories, choose ONE of these approaches:
+           - Use absolute paths in commands
+           - Combine 'cd' and the actual command in the same step with '&&' (e.g., "cd /path && command")
+           - Use relative paths from the initial directory
+
+        2. When writing files to a new directory, either:
+           - Use the full path: "echo content > /path/to/dir/file.txt"
+           - Combine commands: "cd /path/to/dir && echo content > file.txt"
+           
+        3. Avoid unnecessary 'cd' commands when you can specify the full path directly
+        
+        4. Generate ONLY the shell command, without any prefixes, language indicators, or formatting.
+           DO NOT include language indicators like 'shell:', 'bash:', or any formatting marks.
+           NEVER prefix the command with words like 'shell', 'bash', 'zsh'.
+           JUST output the raw command that should be executed, nothing else.
+        """
+        
+        # Get directory context
+        dir_context = self.get_directory_context()
+        
+        # Format information about previous steps
+        previous_steps_info = ""
+        for i, prev_step in enumerate(previous_steps, 1):
+            previous_steps_info += f"Step {i}: {prev_step['description']}\n"
+            if 'expected_outcome' in prev_step:
+                previous_steps_info += f"Expected outcome: {prev_step['expected_outcome']}\n"
+            previous_steps_info += "\n"
+        
+        user_content = f"""Task: {task}
+
+Current Directory Information:
+{dir_context}
+
+Previous Steps:
+{previous_steps_info}
+
+Current Step to Generate Command For:
+Description: {step['description']}
+Expected Outcome: {step.get('expected_outcome', 'No expected outcome provided')}
+Phase: {step.get('phase', 'unknown')}
+
+Generate ONLY the shell command for this step. DO NOT include any language indicators, explanations, or formatting.
+DO NOT prefix with 'shell', 'bash', or any other word. Just provide the raw command."""
+        
+        try:
+            # Generate the command
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.2
+            )
+            
+            command = response.choices[0].message.content.strip()
+            
+            # Remove any markdown formatting if present
+            if command.startswith("```") and command.endswith("```"):
+                command = command[3:-3].strip()
+            elif command.startswith("`") and command.endswith("`"):
+                command = command[1:-1].strip()
+                
+            # Remove common language prefixes that might cause errors
+            command = re.sub(r'^(?:shell|bash|zsh)[:]\s*', '', command)
+            command = re.sub(r'^(?:shell|bash|zsh)\s+', '', command)
+            
+            # Log the cleaned command
+            self.log_debug(f"Generated step command (after cleanup): {command}")
+                
+            return command
+            
+        except Exception as e:
+            console.print(f"[bold red]Error generating command: {str(e)}[/bold red]")
+            if self.debug:
+                import traceback
+                console.print(traceback.format_exc())
+            return f"echo 'Error generating command: {str(e)}'"
+    
+    def verify_step_success(self, step: Dict, command: str, output: str, execution_success: bool) -> Dict:
+        """
+        Verify if a step achieved its intended purpose beyond just execution success.
+        
+        Args:
+            step: Step information
+            command: The command that was executed
+            output: Output from command execution
+            execution_success: Whether the command executed without errors
+            
+        Returns:
+            Dict: Verification result with success boolean and message
+        """
+        if not execution_success:
+            return {
+                "success": False,
+                "message": "Command execution failed with errors."
+            }
+            
+        # Special case for file listing commands - if they executed successfully, consider it a success
+        if (command.strip().startswith("find") or command.strip().startswith("ls") or 
+            "ls -" in command or "find ." in command):
+            # For file listing commands, success means it ran without error, even if it found few or no files
+            return {
+                "success": True,
+                "message": f"Command executed successfully. {'Files were found.' if output.strip() else 'No files matched the criteria, which is a valid outcome.'}"
+            }
+            
+        system_message = """You are an AI assistant that verifies if a shell command achieved its intended purpose.
+        Given a step description, expected outcome, the command that was executed, and its output,
+        determine if the step was successful in achieving its intended purpose.
+        
+        Be critical but fair in your assessment. Don't just check if the command ran without errors,
+        but verify if it actually accomplished what it was supposed to do based on the expected outcome.
+        
+        IMPORTANT GUIDELINES:
+        1. For file listing commands, consider it a success if the command executed without errors,
+           even if it found no files or just a few files.
+        2. For search commands, finding no matches can be a valid result - it means the search was 
+           performed but no items matched the criteria.
+        3. Be realistic about success criteria - don't expect unreasonable outcomes.
+        """
+        
+        user_content = f"""Step Description: {step['description']}
+Expected Outcome: {step.get('expected_outcome', 'No expected outcome provided')}
+Command Executed: {command}
+Command Output: 
+{output}
+
+Did this step achieve its intended purpose? Provide a boolean (true/false) and a brief explanation.
+
+Remember:
+- If this is a file listing or search command, finding few or no results is still success if the command executed properly.
+- The expected outcome should be interpreted reasonably - don't be overly demanding.
+"""
+        
+        try:
+            # Verify the step success
+            response = openai.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.1
+            )
+            
+            verification_text = response.choices[0].message.content.lower()
+            
+            # Parse the verification response
+            success = "true" in verification_text[:20] or "yes" in verification_text[:20]
+            
+            # Extract the explanation
+            message = verification_text
+            if "true" in verification_text[:20]:
+                message = verification_text.split("true", 1)[1].strip()
+            elif "false" in verification_text[:20]:
+                message = verification_text.split("false", 1)[1].strip()
+            elif "yes" in verification_text[:20]:
+                message = verification_text.split("yes", 1)[1].strip()
+            elif "no" in verification_text[:20]:
+                message = verification_text.split("no", 1)[1].strip()
+                
+            # Clean up the message
+            if message.startswith(".") or message.startswith(":") or message.startswith(","):
+                message = message[1:].strip()
+                
+            return {
+                "success": success,
+                "message": message
+            }
+            
+        except Exception as e:
+            console.print(f"[bold red]Error verifying step: {str(e)}[/bold red]")
+            if self.debug:
+                import traceback
+                console.print(traceback.format_exc())
+            return {
+                "success": execution_success,  # Fall back to execution success
+                "message": f"Could not verify due to error: {str(e)}"
+            }
+    
+    def fix_failed_step(self, step: Dict, failed_command: str, output: str, verification: Dict) -> bool:
+        """
+        Try to fix a failed step and retry.
+        
+        Args:
+            step: Step information
+            failed_command: The command that failed
+            output: Output from the failed command
+            verification: The verification result
+            
+        Returns:
+            bool: Whether the step was fixed successfully
+        """
+        console.print("[blue]Analyzing the failure and generating a fix...[/blue]")
+        
+        system_message = """You are an AI assistant that fixes failed shell commands.
+        Given a step description, the command that failed, and the error output,
+        analyze what went wrong and generate a new command that should work correctly.
+        """
+        
+        user_content = f"""Task Step: {step['description']}
+Expected Outcome: {step.get('expected_outcome', 'No expected outcome provided')}
+Failed Command: {failed_command}
+Error/Output: 
+{output}
+Verification Result: {verification['message']}
+
+Please analyze what went wrong and generate a new command that will achieve the intended purpose."""
+        
+        try:
+            # Generate a fix
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.2
+            )
+            
+            analysis_and_fix = response.choices[0].message.content
+            
+            # Extract just the command portion if there's an explanation
+            command_lines = []
+            capture = False
+            for line in analysis_and_fix.split('\n'):
+                line = line.strip()
+                if line.startswith('```') and not capture:
+                    capture = True
+                    continue
+                elif line.startswith('```') and capture:
+                    capture = False
+                    continue
+                elif capture:
+                    command_lines.append(line)
+                elif line.startswith('`') and line.endswith('`'):
+                    command_lines.append(line[1:-1])
+            
+            # If we found code blocks, use those
+            if command_lines:
+                fixed_command = '\n'.join(command_lines)
+            else:
+                # Otherwise, use the last non-empty line as a fallback
+                lines = [line for line in analysis_and_fix.split('\n') if line.strip()]
+                fixed_command = lines[-1] if lines else analysis_and_fix
+            
+            # Display the analysis and the fix
+            console.print("[bold blue]Analysis and Fix:[/bold blue]")
+            console.print(analysis_and_fix)
+            console.print("\n[bold blue]Executing fixed command:[/bold blue]")
+            console.print(Syntax(fixed_command, "bash", theme="monokai", line_numbers=False))
+            
+            # Check if the fixed command is dangerous
+            danger_assessment = self.check_command_danger_with_ai(fixed_command)
+            
+            # Execute the fixed command
+            if self.mode == "manual" or danger_assessment:
+                output, success = self.execute_with_confirmation(fixed_command, "Fixed command", is_dangerous=danger_assessment)
+            else:
+                output, success = self.execute_command(fixed_command)
+            
+            # Verify if the fix worked
+            fix_verification = self.verify_step_success(step, fixed_command, output, success)
+            
+            if fix_verification['success']:
+                console.print(f"[bold green]Fix successful: {fix_verification['message']}[/bold green]")
+                return True
+            else:
+                console.print(f"[bold red]Fix attempt failed: {fix_verification['message']}[/bold red]")
+                return False
+                
+        except Exception as e:
+            console.print(f"[bold red]Error fixing step: {str(e)}[/bold red]")
+            if self.debug:
+                import traceback
+                console.print(traceback.format_exc())
+            return False
+            
     def handle_content_creation_task(self, task: str):
         """
         Handle content creation tasks like writing reports, articles, etc.
