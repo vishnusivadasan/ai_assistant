@@ -4356,20 +4356,20 @@ Remember:
         """
         
         user_content = f"""Task Step: {step['description']}
-Expected Outcome: {step.get('expected_outcome', 'No expected outcome provided')}
-Phase: {step.get('phase', 'unknown')}
-Failed Command: {failed_command}
-Error/Output: 
-{output}
-Verification Result: {verification['message']}
+                        Expected Outcome: {step.get('expected_outcome', 'No expected outcome provided')}
+                        Phase: {step.get('phase', 'unknown')}
+                        Failed Command: {failed_command}
+                        Error/Output: 
+                        {output}
+                        Verification Result: {verification['message']}
 
-Current Directory State:
-{current_dir_state}
+                        Current Directory State:
+                        {current_dir_state}
 
-Please analyze what went wrong and generate a new command that will achieve the intended purpose.
-Remember to consider the current state of the system - if files were already moved or deleted, don't try to access them again.
-Also, ensure the command is appropriate for the step's phase ({step.get('phase', 'unknown')}).
-"""
+                        Please analyze what went wrong and generate a new command that will achieve the intended purpose.
+                        Remember to consider the current state of the system - if files were already moved or deleted, don't try to access them again.
+                        Also, ensure the command is appropriate for the step's phase ({step.get('phase', 'unknown')}).
+                        """
         
         try:
             # Generate a fix
