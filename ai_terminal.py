@@ -161,6 +161,20 @@ class FileLogger:
         with open(self.log_file, 'a') as f:
             f.write(f"\nSYSTEM [{datetime.now().strftime('%H:%M:%S')}]: {message}\n")
     
+    def log_answer(self, answer: str):
+        """
+        Log an AI-generated answer to the conversation file with clear formatting.
+        
+        Args:
+            answer: The AI's answer content
+        """
+        with open(self.log_file, 'a') as f:
+            f.write(f"\nANSWER [{datetime.now().strftime('%H:%M:%S')}]:\n")
+            # Add the answer with proper indentation for readability
+            for line in answer.split('\n'):
+                f.write(f"    {line}\n")
+            f.write("\n")  # Add extra newline for separation
+    
     def get_conversation_history(self) -> str:
         """
         Get the entire conversation history from the log file.
@@ -462,6 +476,7 @@ class AITerminal:
         - **Conversation Logging**: All interactions are logged to plain text files in {logs_folder}
         - **Full Output Capture**: Complete command output is captured and can be viewed with 'show output'
         - **Content Creation**: Can generate reports, articles, and other content with proper formatting
+        - **General Information**: Can answer general knowledge questions without executing commands
         
         ## Context Awareness
         The AI Terminal remembers your previous commands, their results, and conversations.
@@ -484,6 +499,14 @@ class AITerminal:
         3. Create comprehensive content
         4. Allow you to save the content as a Markdown file
         
+        ## General Information Questions
+        You can ask general knowledge questions directly, and the AI will answer them without executing commands:
+        - "What is the capital of France?"
+        - "When is Christmas?"
+        - "How many days are in a year?"
+        - "Who was the first person to walk on the moon?"
+        - "Explain how photosynthesis works"
+        
         ## Safety Features
         - Commands are analyzed for potential risks using both rule-based checks and AI
         - You will only be asked for confirmation when a command is potentially dangerous
@@ -497,6 +520,7 @@ class AITerminal:
         - "Write a detailed report on renewable energy sources"
         - "ls -la" (direct execution)
         - "What was the last command you ran?" (context query)
+        - "What is the capital of Japan?" (general information question)
         """
         
         help_text = help_text.format(
@@ -509,18 +533,165 @@ class AITerminal:
         )
         console.print(Markdown(help_text))
     
-    def process_request(self, user_input: str):
+    def is_general_information_question(self, user_input: str) -> bool:
+        """
+        Determine if the user input is a general information question by querying the API
+        rather than using rule-based detection.
+        
+        Args:
+            user_input: User's input text
+            
+        Returns:
+            bool: True if the API determines this is a general information question, False otherwise
+        """
+        self.log_debug(f"Checking if query is a general information question: {user_input}")
+        
+        # Create a system message for question classification
+        system_message = """You are an AI assistant that classifies user queries.
+        Determine if the given query is a general information/knowledge question that should be answered directly,
+        or if it's a request for terminal command execution.
+        
+        General information questions seek factual information, explanations, or knowledge that doesn't require command execution.
+        Examples of general information questions:
+        - "What is the capital of France?"
+        - "When is Christmas?"
+        - "How many days are in a year?"
+        - "Explain how photosynthesis works"
+        - "Who invented the internet?"
+        
+        Terminal command requests ask for actions to be performed on the system.
+        Examples of terminal command requests:
+        - "List all files in the current directory"
+        - "Find all Python files containing the word 'error'"
+        - "Create a new directory called 'project'"
+        - "Check disk usage"
+        - "Install node.js"
+        
+        Respond with ONLY "general_info" or "command_request" without any explanation.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_input}
+        ]
+        
+        try:
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                max_tokens=15,
+                temperature=0
+            )
+            
+            # Extract the response text
+            response_text = response.choices[0].message.content.strip().lower()
+            self.log_debug(f"API classification response: {response_text}")
+            
+            # Check if the API considers this a general information question
+            return "general_info" in response_text
+            
+        except Exception as e:
+            # Log error but continue with assumption it's not a general info question
+            self.log_debug(f"Error in question classification: {str(e)}")
+            return False
+    
+    def handle_general_information_question(self, question: str):
+        """
+        Handle general information questions by using the AI to generate a direct answer
+        without executing any commands.
+        
+        Args:
+            question: User's question
+        """
+        console.print("[blue]This appears to be a general information question. Let me answer that for you...[/blue]")
+        self.logger.log_system_message("API classified this as a general information question, providing direct answer")
+        
+        # Create a system message for general information responses
+        system_message = """You are a helpful AI assistant answering general information questions.
+        Provide concise, accurate answers to the user's question based on your knowledge.
+        If the question is ambiguous, ask for clarification.
+        If you're not confident in the accuracy of your answer, acknowledge the uncertainty.
+        Respond in a conversational, helpful manner.
+        Format your response using Markdown for readability.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": question}
+        ]
+        
+        try:
+            # Use the animation helper for the API call
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                temperature=0.3
+            )
+            
+            # Display the response
+            answer = response.choices[0].message.content.strip()
+            console.print(Markdown(answer))
+            
+            # Log the response metadata
+            self.logger.log_system_message(f"Response to general information question: {question}")
+            # Log the complete answer content using the dedicated method
+            self.logger.log_answer(answer)
+            
+        except Exception as e:
+            error_msg = f"Error generating answer: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
+    
+    def process_request(self, user_input: str, one_shot_mode: bool = False):
         """
         Process a user request.
         
         Args:
             user_input: Natural language request from the user
+            one_shot_mode: Whether executing in one-shot mode (for more verbose output)
         """
         # Set the current task
         self.current_task = user_input
         
         # Log the user query
+        self.logger.log_system_message(f"Processing request: {user_input}")
         self.logger.log_user_query(user_input)
+        
+        if one_shot_mode:
+            console.print(f"[bold blue]Processing request in {self.mode} mode[/bold blue]")
+            console.print(f"[dim]Direct execution: {'Enabled' if self.direct_execution else 'Disabled'}[/dim]")
+            console.print(f"[dim]Query refinement: {'Enabled' if self.refine_queries else 'Disabled'}[/dim]")
+        
+        # Check for general information questions first
+        if self.is_general_information_question(user_input):
+            self.handle_general_information_question(user_input)
+            return
+        
+        # Check for content creation task directly first with a faster regex check
+        content_patterns = [
+            r'(write|create|generate|prepare).*report',
+            r'(write|create|generate|prepare).*article',
+            r'(write|create|generate|prepare).*document',
+            r'(write|create|generate|prepare).*summary',
+            r'(write|create|generate|prepare).*analysis',
+            r'history of',
+            r'report on',
+            r'write .*about',
+            r'details? (on|about)',
+            r'discuss .*history',
+            r'sections?|chapters?|parts?|segments?|headings?',
+        ]
+        
+        is_content_task = any(re.search(pattern, user_input.lower()) for pattern in content_patterns)
+        
+        if is_content_task:
+            console.print("[blue]Content creation task detected. Entering Agent Mode...[/blue]")
+            self.logger.log_system_message("Content creation task detected - entering Agent Mode directly")
+            self.agent_mode(user_input)
+            return
         
         # Check if the request is about context/conversation history
         if self.is_context_request(user_input):
@@ -537,6 +708,10 @@ class AITerminal:
         if self.refine_queries:
             refined_input = self.refine_user_query(user_input)
             if refined_input != user_input:
+                if one_shot_mode:
+                    console.print(f"[bold cyan]Original query:[/bold cyan] {user_input}")
+                    console.print(f"[bold cyan]Refined query:[/bold cyan] {refined_input}")
+                
                 self.current_task = refined_input
                 self.logger.log_system_message(f"Refined query: {refined_input}")
         else:
@@ -613,6 +788,33 @@ class AITerminal:
                 self.log_debug(f"Complex task detected via pattern matching: {pattern}")
                 self.logger.log_system_message(f"Complex task detected via pattern: {pattern}")
                 return True
+                
+        # Content creation tasks are always complex, double-check with additional patterns
+        content_creation_patterns = [
+            r'write .*about',
+            r'create .*about',
+            r'report on',
+            r'details? (on|about)',
+            r'discuss .*history',
+            r'explain .*history',
+            r'detailed', 
+            r'comprehensive',
+            r'extensive',
+            r'in-depth',
+            r'thorough'
+        ]
+        
+        for pattern in content_creation_patterns:
+            if re.search(pattern, user_input.lower()):
+                self.log_debug(f"Content creation task detected via additional pattern: {pattern}")
+                self.logger.log_system_message(f"Content creation task detected via additional pattern: {pattern}")
+                return True
+        
+        # If user mentions "sections", "chapters", or similar structural terms, it's likely a content task
+        if re.search(r'sections?|chapters?|parts?|segments?|headings?', user_input.lower()):
+            self.log_debug("Content creation task detected via structural terms")
+            self.logger.log_system_message("Content creation task detected via structural terms")
+            return True
                 
         # Use OpenAI to determine if this is a complex task requiring multiple steps
         # Get directory context
@@ -704,6 +906,22 @@ class AITerminal:
         Returns:
             str: Generated shell command
         """
+        # First check if this is a content creation task that should be handled elsewhere
+        content_task_patterns = [
+            r'(write|create|generate|prepare).*report',
+            r'(write|create|generate|prepare).*article',
+            r'(write|create|generate|prepare).*document',
+            r'(write|create|generate|prepare).*summary',
+            r'(write|create|generate|prepare).*analysis',
+            r'history of',
+            r'research (on|about)',
+        ]
+        
+        for pattern in content_task_patterns:
+            if re.search(pattern, user_input.lower()):
+                self.log_debug(f"Content creation task detected in generate_command: {user_input}")
+                return "echo 'This is a content creation task that will be handled by Agent Mode. Please try again and make sure direct execution is not enabled.'"
+        
         system_message = """You are an AI assistant that converts natural language requests into macOS terminal commands.
         Generate the exact shell command(s) that would accomplish the task. Provide ONLY the command, nothing else.
         Use macOS-compatible syntax (zsh/bash). If multiple commands are needed, use && to chain them or ; for sequential execution.
@@ -1106,9 +1324,28 @@ class AITerminal:
             r'(write|create|generate|prepare).*analysis',
             r'history of',
             r'research (on|about)',
+            r'write .*about',
+            r'create .*about',
+            r'report on',
+            r'details? (on|about)',
+            r'discuss .*history',
+            r'explain .*history',
         ]
         
         is_content_task = any(re.search(pattern, task.lower()) for pattern in content_creation_patterns)
+        
+        # Also check for keywords indicating an analysis or detailed report
+        if not is_content_task and re.search(r'detailed|comprehensive|extensive|in-depth|thorough', task.lower()):
+            # If detailed work and likely not a terminal command, treat as content task
+            is_terminal_command = re.search(r'\b(ls|cd|mkdir|touch|rm|cp|mv|cat|grep|find|ps|kill|chmod|git|docker)\b', task.lower())
+            if not is_terminal_command:
+                is_content_task = True
+                self.logger.log_system_message("Content task detected based on detail level and non-terminal nature")
+                
+        # Check for structural indicators like sections or chapters
+        if not is_content_task and re.search(r'sections?|chapters?|parts?|segments?|headings?', task.lower()):
+            is_content_task = True
+            self.logger.log_system_message("Content task detected based on structural terms")
         
         if is_content_task:
             console.print("[bold blue]Content creation task detected. Generating content...[/bold blue]")
@@ -2149,6 +2386,17 @@ def parse_args():
         default=str(LOGS_FOLDER),
         help="Directory where conversation logs are stored"
     )
+    parser.add_argument(
+        "--request",
+        "-r",
+        type=str,
+        help="Run in one-shot mode with the provided request and exit after completion"
+    )
+    parser.add_argument(
+        "--show-log",
+        action="store_true",
+        help="Display the log after completion when running in one-shot mode"
+    )
     return parser.parse_args()
 
 
@@ -2166,7 +2414,7 @@ if __name__ == "__main__":
         max_log_files=args.max_logs
     )
     
-    # Initialize and run the AI Terminal
+    # Initialize the AI Terminal
     terminal = AITerminal(
         mode=args.mode, 
         debug=args.debug, 
@@ -2179,4 +2427,23 @@ if __name__ == "__main__":
     # Print successful logger setup confirmation
     print(f"AI Terminal initialized with custom logger at: {terminal.logger.logs_folder}")
     
-    terminal.run() 
+    # Check if running in one-shot mode
+    if args.request:
+        console = Console()  # Create console instance for formatted output
+        console.print(f"[bold green]AI Terminal One-Shot Mode[/bold green]")
+        console.print(f"[bold]Request:[/bold] {args.request}")
+        console.print("=" * 50)
+        
+        # Process the request with one-shot mode enabled for more verbose output
+        terminal.process_request(args.request, one_shot_mode=True)
+        
+        console.print("\n" + "=" * 50)
+        console.print("[bold green]Request completed. Output saved to log.[/bold green]")
+        console.print(f"[dim]Log file: {terminal.logger.log_file}[/dim]")
+        
+        if args.show_log:
+            console.print("\n[bold blue]One-Shot Mode Log:[/bold blue]")
+            console.print(Panel(terminal.logger.get_conversation_history(), title=f"Log File: {terminal.logger.log_file}", expand=False))
+    else:
+        # Run in interactive mode
+        terminal.run() 
