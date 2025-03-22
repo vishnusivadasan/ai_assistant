@@ -36,7 +36,7 @@ An intelligent, AI-powered command-line interface that uses natural language pro
 3. Create a `.env` file in the project directory:
    ```bash
    echo "OPENAI_API_KEY=your-api-key-here" > .env
-   echo "OPENAI_MODEL=gpt-4-turbo-preview" >> .env
+   echo "OPENAI_MODEL=gpt-4o" >> .env
    ```
    Replace `your-api-key-here` with your actual OpenAI API key.
 
