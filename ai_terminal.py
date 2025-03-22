@@ -622,9 +622,24 @@ class AITerminal:
             console.print(f"[bold blue]Processing request in {self.mode} mode[/bold blue]")
             console.print(f"[dim]Direct execution: {'Enabled' if self.direct_execution else 'Disabled'}[/dim]")
             console.print(f"[dim]Query refinement: {'Enabled' if self.refine_queries else 'Disabled'}[/dim]")
+        
+        # Refine the query first if enabled
+        if self.refine_queries:
+            refined_input = self.refine_user_query(user_input)
+            if refined_input != user_input:
+                if one_shot_mode:
+                    console.print(f"[bold cyan]Original query:[/bold cyan] {user_input}")
+                    console.print(f"[bold cyan]Refined query:[/bold cyan] {refined_input}")
+                
+                self.current_task = refined_input
+                self.logger.log_system_message(f"Refined query: {refined_input}")
+            else:
+                refined_input = user_input
+        else:
+            refined_input = user_input
             
-        # Classify user intent using API-based approach
-        intent = self.classify_user_intent(user_input)
+        # Classify user intent using API-based approach on the refined input
+        intent = self.classify_user_intent(refined_input)
         primary_intent = intent['primary_intent']
         confidence = intent['confidence']
         
@@ -637,19 +652,19 @@ class AITerminal:
         # Handle different intents based on the classification
         if primary_intent == "general_information":
             # Handle general information questions
-            self.handle_general_information_question(user_input)
+            self.handle_general_information_question(refined_input)
             return
         
         elif primary_intent == "content_creation":
             # Handle content creation tasks
             console.print("[blue]Content creation task detected. Entering Agent Mode...[/blue]")
             self.logger.log_system_message("Content creation task detected - entering Agent Mode directly")
-            self.agent_mode(user_input)
+            self.agent_mode(refined_input)
             return
         
         elif primary_intent == "context_request":
             # Handle context-related questions
-            self.handle_context_request(user_input)
+            self.handle_context_request(refined_input)
             return
         
         elif primary_intent == "direct_command" and self.direct_execution:
@@ -659,33 +674,10 @@ class AITerminal:
             
             if is_dangerous:
                 console.print("[bold yellow]This command may have potential risks.[/bold yellow]")
-                self.execute_with_confirmation(user_input, "Direct shell command execution")
+                self.execute_with_confirmation(refined_input, "Direct shell command execution")
             else:
-                self.execute_command(user_input)
+                self.execute_command(refined_input)
             return
-            
-        # Refine the query if enabled
-        if self.refine_queries:
-            refined_input = self.refine_user_query(user_input)
-            if refined_input != user_input:
-                if one_shot_mode:
-                    console.print(f"[bold cyan]Original query:[/bold cyan] {user_input}")
-                    console.print(f"[bold cyan]Refined query:[/bold cyan] {refined_input}")
-                
-                self.current_task = refined_input
-                self.logger.log_system_message(f"Refined query: {refined_input}")
-                
-                # Re-classify with the refined input if it changed significantly
-                if len(refined_input) > len(user_input) * 1.2 or len(refined_input) < len(user_input) * 0.8:
-                    intent = self.classify_user_intent(refined_input)
-                    primary_intent = intent['primary_intent']
-                    
-                    if one_shot_mode or self.debug:
-                        console.print(f"[dim]Refined intent classification: {primary_intent} (confidence: {intent['confidence']:.2f})[/dim]")
-            else:
-                refined_input = user_input
-        else:
-            refined_input = user_input
         
         # Check if this is a complex task requiring agent mode
         if primary_intent == "complex_task" or intent.get('requires_agent_mode', False):
@@ -819,148 +811,24 @@ class AITerminal:
         system_message = """You are an AI assistant that converts natural language requests into macOS terminal commands.
         Generate the exact shell command(s) that would accomplish the task. Provide ONLY the command, nothing else.
         Use macOS-compatible syntax (zsh/bash). If multiple commands are needed, use && to chain them or ; for sequential execution.
+        
+        IMPORTANT: Always include clear feedback to the user about what is happening at each step:
+        1. For file operations, use conditional statements that echo what was found or done
+           Example: if [ -f file.txt ]; then echo 'file.txt exists'; else touch file.txt && echo 'file.txt created'; fi
+        2. For searches or data processing, echo the intention before the action
+           Example: echo 'Searching for Python files...' && find . -name "*.py"
+        3. For system operations, provide feedback about what's happening
+           Example: echo 'Installing package...' && brew install package
+        4. For commands with potentially no visible output, add informative echo statements
+           Example: mkdir -p new_dir && echo 'Directory new_dir created'
+           
+        The goal is to make every command self-documenting and let the user know exactly what's happening.
         """
         
         # Get directory context
         dir_context = self.get_directory_context()
         
         # Get conversation history from log file
-        conversation_history = self.logger.get_conversation_history()
-        
-        user_message = user_input
-        if context:
-            user_message += f"\n\nContext from previous execution: {context}"
-        
-        # Add directory and conversation context
-        user_message += f"\n\nDirectory Information:\n{dir_context}"
-        user_message += f"\n\nRecent Conversation History:\n{conversation_history}"
-        
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message}
-        ]
-        
-        self.log_debug(f"Generating command for: {user_input}")
-        
-        try:
-            # Show thinking animation while waiting for API response
-            response = self.call_api_with_animation(
-                openai.chat.completions.create,
-                model=openai_model,
-                messages=messages,
-                temperature=0.2
-            )
-            command = response.choices[0].message.content.strip()
-            self.log_debug(f"Generated command: {command}")
-            
-            # Log the generated command
-            self.logger.log_command(command)
-            
-            return command
-        except Exception as e:
-            error_msg = f"Error generating command: {str(e)}"
-            console.print(f"[bold red]{error_msg}[/bold red]")
-            self.logger.log_system_message(f"Error: {error_msg}")
-            return ""
-    
-    def execute_with_confirmation(self, command: str, context: str = "", is_dangerous: bool = False):
-        """
-        Execute a command with user confirmation only if the command is potentially dangerous.
-        
-        Args:
-            command: Shell command to execute
-            context: Optional context about the command
-            is_dangerous: Whether the command is potentially dangerous
-        """
-        if not command:
-            console.print("[bold red]No valid command generated.[/bold red]")
-            return
-        
-        # Show the command that will be executed
-        console.print("\n[bold blue]Generated Command:[/bold blue]")
-        console.print(Syntax(command, "bash", theme="monokai", line_numbers=False))
-        
-        if context:
-            console.print(f"[dim]{context}[/dim]")
-        
-        # Only ask for confirmation if command is potentially dangerous
-        execute = True
-        if is_dangerous:
-            console.print("[bold yellow]This command may have potential risks.[/bold yellow]")
-            execute = Confirm.ask("Are you sure you want to execute this command?", default=False)
-        else:
-            # In either mode, run non-dangerous commands automatically
-            console.print("[dim]Command appears safe, executing automatically...[/dim]")
-        
-        if execute:
-            self.execute_command(command)
-    
-    def is_dangerous_command(self, command: str) -> bool:
-        """
-        Check if a command is potentially dangerous.
-        
-        Args:
-            command: Shell command to check
-            
-        Returns:
-            bool: True if command appears dangerous, False otherwise
-        """
-        command_lower = command.lower()
-        
-        # Check against list of known dangerous commands
-        for dangerous_cmd in DANGEROUS_COMMANDS:
-            if dangerous_cmd in command_lower:
-                return True
-        
-        # Check for sudo commands that remove things
-        if "sudo" in command_lower and ("rm -rf" in command_lower or "rmdir" in command_lower):
-            return True
-            
-        # Check for commands that might affect large areas of the filesystem
-        if "rm -rf" in command_lower and ("/" in command_lower or "~" in command_lower):
-            # Allow if it's a specific subdirectory, but not broad areas
-            if not re.search(r'rm -rf ["\']?[a-zA-Z0-9_\-\.]+["\']?/?$', command_lower):
-                return True
-        
-        return False
-    
-    def check_command_danger_with_ai(self, command: str) -> bool:
-        """
-        Use AI to determine if a command is potentially dangerous.
-        
-        Args:
-            command: Shell command to check
-            
-        Returns:
-            bool: True if AI thinks command is dangerous, False otherwise
-        """
-        try:
-            self.log_debug(f"Checking command danger with AI: {command}")
-            
-            # Create a system message for danger assessment
-            system_message = """You are an AI assistant that assesses the safety of shell commands.
-            Analyze the given command and determine if it's potentially dangerous or destructive.
-            Consider risks like:
-            - Data deletion or corruption
-            - System modification that's hard to reverse
-            - Security vulnerabilities
-            - Resource exhaustion
-            - Privilege escalation
-            - Execution of untrusted code
-            - Files being moved to unintended locations
-            - Important system files being modified
-            
-            Respond with a JSON object containing:
-            - "is_dangerous": true/false indicating if the command is potentially risky
-            - "reason": Brief explanation of your assessment
-            - "risk_level": A number from 0-10 indicating the risk level (0 = no risk, 10 = extreme risk)
-            
-            Be cautious - if there's any significant risk, mark the command as dangerous.
-            """
-            
-            # Get directory context
-            dir_context = self.get_directory_context()
-            
             # Create the message list
             messages = [
                 {"role": "system", "content": system_message},
