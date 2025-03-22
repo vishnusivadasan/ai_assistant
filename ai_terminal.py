@@ -1466,12 +1466,34 @@ class AITerminal:
         - description: Brief description of what this step does
         - command: The exact shell command to run
         - critical: Boolean indicating if this step is critical (failure should stop execution)
+        
+        IMPORTANT GUIDELINES FOR COMMAND EXECUTION:
+        
+        1. DIRECTORY PERSISTENCE: Each command is executed in a separate subprocess, so directory changes with 'cd' DO NOT persist between steps.
+           When working with directories, choose ONE of these approaches:
+           - Use absolute paths in commands
+           - Combine 'cd' and the actual command in the same step with '&&' (e.g., "cd /path && command")
+           - Use relative paths from the initial directory
+
+        2. When writing files to a new directory, either:
+           - Use the full path: "echo content > /path/to/dir/file.txt"
+           - Combine commands: "cd /path/to/dir && echo content > file.txt"
+           
+        3. Avoid unnecessary 'cd' commands when you can specify the full path directly
+        
+        4. For multi-part operations in the same directory, consider combining them with '&&' in a single step
         """
         
         # Get directory context
         dir_context = self.get_directory_context()
         
-        user_content = f"Task: {task}\n\nDirectory Information:\n{dir_context}"
+        user_content = f"""Task: {task}
+
+Directory Information:
+{dir_context}
+
+IMPORTANT NOTE: Remember that each command runs separately, so directory changes with 'cd' won't persist across steps. 
+Use absolute paths, combined commands with &&, or ensure your paths account for this limitation."""
         
         messages = [
             {"role": "system", "content": system_message},
@@ -1575,10 +1597,26 @@ class AITerminal:
         4. There are no missing steps
         5. There are no unnecessary steps
         
+        IMPORTANT: Pay special attention to these common issues:
+        
+        - Directory persistence: When the plan includes a 'cd' command, subsequent commands will NOT inherit the directory change when executed separately.
+          This is because each command runs in its own subprocess. Fix this by either:
+          a) Combining steps with directory changes using && (e.g., "cd dir && command")
+          b) Using absolute paths in subsequent commands
+          c) Prepending the target directory to all file operations (e.g., "echo content > dir/file" instead of "cd dir" then "echo content > file")
+        
+        - Command dependencies: Ensure that commands which depend on previous commands' outputs are properly sequenced
+        
+        - Error handling: Consider adding checks to verify critical steps succeeded before proceeding
+        
+        - Permission issues: Check if commands might require permissions (e.g., sudo) or create files in protected directories
+        
+        - File overwriting: Be cautious about commands that might overwrite existing files without confirmation
+        
         If improvements are needed, provide a refined plan in the same format.
         Format your response as JSON with:
         - is_good: Boolean indicating if the plan is sound (true) or needs refinement (false)
-        - feedback: Brief explanation of your assessment
+        - feedback: Brief explanation of your assessment, particularly highlighting issues like directory persistence
         - refined_plan: The improved plan if is_good is false, otherwise null
         """
         
@@ -1597,7 +1635,8 @@ Directory Information:
 Recent Conversation History:
 {conv_history}
 
-Please verify if this plan is sound and complete for accomplishing the task."""
+Please verify if this plan is sound and complete for accomplishing the task. 
+Pay special attention to directory persistence issues - if any step changes directory with 'cd', subsequent commands need to account for this by either using absolute paths or combining commands with &&."""
         
         messages = [
             {"role": "system", "content": system_message},
@@ -2294,7 +2333,7 @@ def parse_args():
     parser.add_argument(
         "--max-plan-iterations",
         type=int,
-        default=1,
+        default=3,
         help="Maximum number of iterations for plan verification"
     )
     parser.add_argument(
