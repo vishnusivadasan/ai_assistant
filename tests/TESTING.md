@@ -19,9 +19,9 @@ Before running the tests, ensure you have:
 
 ## Available Test Scripts
 
-We've provided three test scripts to verify different aspects of the API-based decision making:
+We've provided three test scripts to verify different aspects of the API-based decision making. All test scripts are located in the `tests/` directory.
 
-### 1. Intent Classification Test (`test_ai_terminal.py`)
+### 1. Intent Classification Test (`tests/test_ai_terminal.py`)
 
 This script tests how the AI classifies different types of user input, including:
 - Direct shell commands
@@ -34,12 +34,13 @@ This script tests how the AI classifies different types of user input, including
 
 Run the test:
 ```
+cd tests
 python test_ai_terminal.py
 ```
 
 The results will be displayed in the terminal and saved to `intent_classification_results.json` for review.
 
-### 2. Command Danger Assessment Test (`test_command_danger.py`)
+### 2. Command Danger Assessment Test (`tests/test_command_danger.py`)
 
 This script tests the AI's ability to assess whether commands are dangerous, including:
 - Safe commands
@@ -48,17 +49,19 @@ This script tests the AI's ability to assess whether commands are dangerous, inc
 
 Run the test:
 ```
+cd tests
 python test_command_danger.py
 ```
 
 The results will be displayed in the terminal and saved to `command_danger_results.json` for review.
 
-### 3. Full Request Processing Test (`test_process_request.py`)
+### 3. Full Request Processing Test (`tests/test_process_request.py`)
 
 This script tests the complete request processing flow to verify that the API-based classification leads to correct handling of different types of requests.
 
 Run the test:
 ```
+cd tests
 python test_process_request.py
 ```
 

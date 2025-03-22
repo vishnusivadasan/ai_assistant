@@ -6,8 +6,12 @@ to verify that the API-based danger assessment works correctly.
 """
 
 import os
+import sys
 import json
 from dotenv import load_dotenv
+
+# Add the parent directory to sys.path to import the ai_terminal module
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from ai_terminal import AITerminal, FileLogger
 
 # Load environment variables from .env file
