@@ -870,10 +870,38 @@ class AITerminal:
             # Add command to history
             self.command_history.append(command)
             
+            # Special handling for find commands
+            is_find_command = command.strip().startswith('find ')
+            
+            # For standalone find commands, use specialized handler
+            if is_find_command and '|' not in command and '>' not in command:
+                self.log_debug(f"Using special find command handler for: {command}")
+                output, success = self._capture_find_command_output(command)
+                
+                # Calculate execution time (approximate since we're returning early)
+                execution_time = 0.1  # Placeholder value
+                
+                # Show execution status
+                status_str = "[bold green]Success[/bold green]" if success else "[bold red]Failed[/bold red]"
+                console.print(f"\n{status_str} (Exit code: {0 if success else 1}, Time: {execution_time:.2f}s)")
+                console.print(f"[dim]Full output captured and logged to: {self.logger.log_file}[/dim]")
+                
+                # Log the result
+                self.logger.log_result(output, success)
+                
+                # If the command failed, attempt to fix or provide context
+                if not success:
+                    self.handle_error(command, output)
+                
+                return output, success
+            
+            # For all other commands, proceed with the standard approach
+            original_command = command
+            
             # First try to determine if this is a simple command that will have short output
-            # If so, use subprocess.run which is more reliable for capturing all output
             is_complex_command = ('|' in command or '>' in command or 
-                                 any(cmd in command for cmd in ['find', 'grep', 'awk', 'sort']))
+                                 any(cmd in command for cmd in ['grep', 'awk', 'sort']) or
+                                 is_find_command)  # Still treat piped find as complex
             is_interactive = any(cmd in command for cmd in ['vim', 'nano', 'less', 'more', 'top'])
             
             # Start timing
@@ -928,7 +956,18 @@ class AITerminal:
                     output_lines = []
                     error_lines = []
                     
+                    # Add timeout handling for complex commands (especially find)
+                    max_execution_time = 60  # 60 seconds timeout for complex commands
+                    start_execution_time = time.time()
+                    
                     while process.poll() is None:
+                        # Check for timeout
+                        if time.time() - start_execution_time > max_execution_time:
+                            process.terminate()
+                            output_lines.append("\n\n[Command terminated after timeout of 60 seconds]\n")
+                            console.print("\n\n[bold red]Command terminated after timeout of 60 seconds[/bold red]\n")
+                            break
+                            
                         # Read any new output
                         stdout_line = process.stdout.readline()
                         if stdout_line:
@@ -2809,7 +2848,7 @@ Remember:
         
         if phase == 'analysis':
             # Analysis phase should only have read-only commands
-            valid = command_type in ['read_only', 'information']
+            valid = command_type in ['read_only', 'information', 'combined']
             message = (
                 "Valid analysis command" if valid else 
                 f"Invalid command for analysis phase - {command_type} operations should not be used in this phase"
@@ -2837,6 +2876,61 @@ Remember:
             "message": message,
             "command_type": command_type
         }
+    
+    def _capture_find_command_output(self, command: str) -> Tuple[str, bool]:
+        """
+        Special handling for find commands to ensure all results are captured.
+        
+        Args:
+            command: The find command to execute
+            
+        Returns:
+            Tuple[str, bool]: Command output and success flag
+        """
+        try:
+            self.log_debug(f"Using specialized find command handler for: {command}")
+            
+            # Execute the command and capture output
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True,
+                executable=self.shell,
+                text=True,
+                bufsize=-1  # Fully buffered to ensure all output is captured
+            )
+            
+            output = result.stdout
+            errors = result.stderr
+            success = result.returncode == 0
+            
+            # Print a separator line
+            console.print("\n" + "-" * 50)
+            
+            # Display captured output
+            if output.strip():
+                console.print("\n[bold cyan]Command Output:[/bold cyan]")
+                
+                # Process the output line by line to ensure proper display
+                output_lines = output.strip().split('\n')
+                for line in output_lines:
+                    console.print(line.strip())
+                    
+            if errors.strip():
+                console.print("\n[bold red]Command Errors:[/bold red]")
+                console.print(errors)
+            
+            # Print a separator line
+            console.print("-" * 50)
+            
+            return output, success
+            
+        except Exception as e:
+            error_msg = f"Error executing find command: {str(e)}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            self.logger.log_system_message(f"Error: {error_msg}")
+            return error_msg, False
 
 
 def parse_args():
