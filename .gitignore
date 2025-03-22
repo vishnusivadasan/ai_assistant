@@ -166,3 +166,9 @@ cython_debug/
 # Logs
 logs/
 *.log
+
+# AI Terminal specific
+command_danger_results.json
+intent_classification_results.json
+write_a_*.md
+testfile.txt
