@@ -535,67 +535,25 @@ class AITerminal:
     
     def is_general_information_question(self, user_input: str) -> bool:
         """
-        Determine if the user input is a general information question by querying the API
-        rather than using rule-based detection.
+        Determine if the user input is a general information question using our API-based classification.
+        This method is kept for backward compatibility but now uses the unified API-based approach.
         
         Args:
             user_input: User's input text
             
         Returns:
-            bool: True if the API determines this is a general information question, False otherwise
+            bool: True if the input is classified as a general information question, False otherwise
         """
         self.log_debug(f"Checking if query is a general information question: {user_input}")
         
-        # Create a system message for question classification
-        system_message = """You are an AI assistant that classifies user queries.
-        Determine if the given query is a general information/knowledge question that should be answered directly,
-        or if it's a request for terminal command execution.
+        # Use the API-based classification instead of a separate API call
+        intent = self.classify_user_intent(user_input)
         
-        General information questions seek factual information, explanations, or knowledge that doesn't require command execution.
-        Examples of general information questions:
-        - "What is the capital of France?"
-        - "When is Christmas?"
-        - "How many days are in a year?"
-        - "Explain how photosynthesis works"
-        - "Who invented the internet?"
+        # Log the classification result
+        self.log_debug(f"General information check via API: {intent['primary_intent']}")
         
-        Terminal command requests ask for actions to be performed on the system.
-        Examples of terminal command requests:
-        - "List all files in the current directory"
-        - "Find all Python files containing the word 'error'"
-        - "Create a new directory called 'project'"
-        - "Check disk usage"
-        - "Install node.js"
-        
-        Respond with ONLY "general_info" or "command_request" without any explanation.
-        """
-        
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_input}
-        ]
-        
-        try:
-            # Use the animation helper for the API call
-            response = self.call_api_with_animation(
-                openai.chat.completions.create,
-                model=openai_model,
-                messages=messages,
-                max_tokens=15,
-                temperature=0
-            )
-            
-            # Extract the response text
-            response_text = response.choices[0].message.content.strip().lower()
-            self.log_debug(f"API classification response: {response_text}")
-            
-            # Check if the API considers this a general information question
-            return "general_info" in response_text
-            
-        except Exception as e:
-            # Log error but continue with assumption it's not a general info question
-            self.log_debug(f"Error in question classification: {str(e)}")
-            return False
+        # Return true if the API classified this as a general information question
+        return intent['primary_intent'] == 'general_information'
     
     def handle_general_information_question(self, question: str):
         """
@@ -664,44 +622,46 @@ class AITerminal:
             console.print(f"[bold blue]Processing request in {self.mode} mode[/bold blue]")
             console.print(f"[dim]Direct execution: {'Enabled' if self.direct_execution else 'Disabled'}[/dim]")
             console.print(f"[dim]Query refinement: {'Enabled' if self.refine_queries else 'Disabled'}[/dim]")
+            
+        # Classify user intent using API-based approach
+        intent = self.classify_user_intent(user_input)
+        primary_intent = intent['primary_intent']
+        confidence = intent['confidence']
         
-        # Check for general information questions first
-        if self.is_general_information_question(user_input):
+        # Log the classification result if in verbose mode
+        if one_shot_mode or self.debug:
+            console.print(f"[dim]Intent classification: {primary_intent} (confidence: {confidence:.2f})[/dim]")
+            if 'analysis' in intent:
+                console.print(f"[dim]Analysis: {intent['analysis']}[/dim]")
+        
+        # Handle different intents based on the classification
+        if primary_intent == "general_information":
+            # Handle general information questions
             self.handle_general_information_question(user_input)
             return
         
-        # Check for content creation task directly first with a faster regex check
-        content_patterns = [
-            r'(write|create|generate|prepare).*report',
-            r'(write|create|generate|prepare).*article',
-            r'(write|create|generate|prepare).*document',
-            r'(write|create|generate|prepare).*summary',
-            r'(write|create|generate|prepare).*analysis',
-            r'history of',
-            r'report on',
-            r'write .*about',
-            r'details? (on|about)',
-            r'discuss .*history',
-            r'sections?|chapters?|parts?|segments?|headings?',
-        ]
-        
-        is_content_task = any(re.search(pattern, user_input.lower()) for pattern in content_patterns)
-        
-        if is_content_task:
+        elif primary_intent == "content_creation":
+            # Handle content creation tasks
             console.print("[blue]Content creation task detected. Entering Agent Mode...[/blue]")
             self.logger.log_system_message("Content creation task detected - entering Agent Mode directly")
             self.agent_mode(user_input)
             return
         
-        # Check if the request is about context/conversation history
-        if self.is_context_request(user_input):
+        elif primary_intent == "context_request":
+            # Handle context-related questions
             self.handle_context_request(user_input)
             return
         
-        # Check if user input is a direct shell command
-        if self.direct_execution and self.is_shell_command(user_input):
+        elif primary_intent == "direct_command" and self.direct_execution:
+            # Handle direct shell commands
             console.print("[blue]Detected shell command. Executing directly...[/blue]")
-            self.execute_with_confirmation(user_input, "Direct shell command execution")
+            is_dangerous = intent.get('dangerous_command', False)
+            
+            if is_dangerous:
+                console.print("[bold yellow]This command may have potential risks.[/bold yellow]")
+                self.execute_with_confirmation(user_input, "Direct shell command execution")
+            else:
+                self.execute_command(user_input)
             return
             
         # Refine the query if enabled
@@ -714,21 +674,40 @@ class AITerminal:
                 
                 self.current_task = refined_input
                 self.logger.log_system_message(f"Refined query: {refined_input}")
+                
+                # Re-classify with the refined input if it changed significantly
+                if len(refined_input) > len(user_input) * 1.2 or len(refined_input) < len(user_input) * 0.8:
+                    intent = self.classify_user_intent(refined_input)
+                    primary_intent = intent['primary_intent']
+                    
+                    if one_shot_mode or self.debug:
+                        console.print(f"[dim]Refined intent classification: {primary_intent} (confidence: {intent['confidence']:.2f})[/dim]")
+            else:
+                refined_input = user_input
         else:
             refined_input = user_input
         
-        # If the task requires multiple steps, use agent mode
-        if self.is_complex_task(refined_input):
+        # Check if this is a complex task requiring agent mode
+        if primary_intent == "complex_task" or intent.get('requires_agent_mode', False):
             console.print("[blue]This looks like a complex task. Using Agent Mode to break it down...[/blue]")
             self.agent_mode(refined_input)
         else:
-            # Generate a command for the request
+            # Handle as a simple task requiring a single command
             command = self.generate_command(refined_input)
-            self.execute_with_confirmation(command)
+            
+            # Check if the command is dangerous using the API classification
+            is_dangerous = intent.get('dangerous_command', False)
+            
+            # If classification didn't include danger assessment, double-check
+            if 'dangerous_command' not in intent:
+                is_dangerous = self.check_command_danger_with_ai(command)
+                
+            self.execute_with_confirmation(command, is_dangerous=is_dangerous)
     
     def is_context_request(self, user_input: str) -> bool:
         """
         Determine if the user is asking about previous actions or context.
+        This method is kept for backward compatibility but now uses the API-based approach.
         
         Args:
             user_input: User's input
@@ -736,31 +715,19 @@ class AITerminal:
         Returns:
             bool: True if this is a context-related question
         """
-        # Common patterns for context-related questions
-        context_patterns = [
-            r'what (file|files|directory|folder).*(create|made|did)',
-            r'what (did|have) you (do|done|create|made)',
-            r'show me what you (did|have done)',
-            r'what (was|were) the (result|output)',
-            r'what happened (when|with)',
-            r'can you (tell|remind) me (what|which)',
-            r'what (commands?|actions?) (did|have) you (run|execute|performed?)',
-            r'(list|show) (the|all) files you (created|modified|changed)',
-            r'what (is|was) the last (command|file|action)'
-        ]
+        # Use the API-based classification instead of rule-based patterns
+        intent = self.classify_user_intent(user_input)
         
-        user_input_lower = user_input.lower()
+        # Log the classification result
+        self.log_debug(f"Context request check via API: {intent['primary_intent']}")
         
-        for pattern in context_patterns:
-            if re.search(pattern, user_input_lower):
-                self.log_debug(f"Detected context request: {user_input}")
-                return True
-                
-        return False
+        # Return true if the API classified this as a context request
+        return intent['primary_intent'] == 'context_request'
     
     def is_complex_task(self, user_input: str) -> bool:
         """
         Determine if a task is complex enough to warrant using Agent Mode.
+        This method is kept for backward compatibility but now uses the API-based approach.
         
         Args:
             user_input: User's natural language request
@@ -768,87 +735,14 @@ class AITerminal:
         Returns:
             bool: True if the task appears complex, False otherwise
         """
-        # Quick pattern-based check for obviously complex tasks
-        complex_patterns = [
-            r'(write|create|generate|prepare).*report',
-            r'(write|create|generate|prepare).*article',
-            r'(write|create|generate|prepare).*document',
-            r'(write|create|generate|prepare).*summary',
-            r'(write|create|generate|prepare).*analysis',
-            r'(research|analyze).*and.*(write|create|report)',
-            r'multiple (steps|sections|parts)',
-            r'(plan|roadmap|strategy) for',
-            r'history of',
-            r'compare.*and.*contrast'
-        ]
+        # Use the API-based classification instead of rule-based patterns
+        intent = self.classify_user_intent(user_input)
         
-        # Check for complex patterns first (faster than API call)
-        for pattern in complex_patterns:
-            if re.search(pattern, user_input.lower()):
-                self.log_debug(f"Complex task detected via pattern matching: {pattern}")
-                self.logger.log_system_message(f"Complex task detected via pattern: {pattern}")
-                return True
-                
-        # Content creation tasks are always complex, double-check with additional patterns
-        content_creation_patterns = [
-            r'write .*about',
-            r'create .*about',
-            r'report on',
-            r'details? (on|about)',
-            r'discuss .*history',
-            r'explain .*history',
-            r'detailed', 
-            r'comprehensive',
-            r'extensive',
-            r'in-depth',
-            r'thorough'
-        ]
+        # Log the classification result
+        self.log_debug(f"Complex task check via API: {intent['primary_intent']}")
         
-        for pattern in content_creation_patterns:
-            if re.search(pattern, user_input.lower()):
-                self.log_debug(f"Content creation task detected via additional pattern: {pattern}")
-                self.logger.log_system_message(f"Content creation task detected via additional pattern: {pattern}")
-                return True
-        
-        # If user mentions "sections", "chapters", or similar structural terms, it's likely a content task
-        if re.search(r'sections?|chapters?|parts?|segments?|headings?', user_input.lower()):
-            self.log_debug("Content creation task detected via structural terms")
-            self.logger.log_system_message("Content creation task detected via structural terms")
-            return True
-                
-        # Use OpenAI to determine if this is a complex task requiring multiple steps
-        # Get directory context
-        dir_context = self.get_directory_context()
-        
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that determines if a task requires multiple steps or shell commands to complete, or if it requires non-command line work like content creation. For content creation, research, writing, or analysis tasks, always respond with 'yes'. For simple file operations or single commands, respond with 'no'. Respond with 'yes' or 'no' only."},
-            {"role": "user", "content": f"Does this task require multiple shell commands to complete or involve content creation/writing? Task: {user_input}\n\nDirectory Information:\n{dir_context}"}
-        ]
-        
-        self.log_debug(f"Checking complexity of task: {user_input}")
-        
-        try:
-            # Use the animation helper for the API call
-            response = self.call_api_with_animation(
-                openai.chat.completions.create,
-                model=openai_model,
-                messages=messages,
-                max_tokens=5,
-                temperature=0
-            )
-            response_text = response.choices[0].message.content.strip().lower()
-            self.log_debug(f"Complexity check response: {response_text}")
-            
-            # Log the complexity assessment
-            is_complex = "yes" in response_text
-            self.logger.log_system_message(f"Task complexity assessment: {'Complex' if is_complex else 'Simple'}")
-            
-            return is_complex
-        except Exception as e:
-            self.log_debug(f"Error in complexity check: {str(e)}")
-            self.logger.log_system_message(f"Error in complexity check: {str(e)}")
-            # Default to simple task on error
-            return False
+        # Check if the API classified this as a complex task or requiring agent mode
+        return intent['primary_intent'] == 'complex_task' or intent.get('requires_agent_mode', False)
     
     def handle_context_request(self, user_input: str):
         """
@@ -969,24 +863,18 @@ class AITerminal:
             self.logger.log_system_message(f"Error: {error_msg}")
             return ""
     
-    def execute_with_confirmation(self, command: str, context: str = ""):
+    def execute_with_confirmation(self, command: str, context: str = "", is_dangerous: bool = False):
         """
         Execute a command with user confirmation only if the command is potentially dangerous.
         
         Args:
             command: Shell command to execute
             context: Optional context about the command
+            is_dangerous: Whether the command is potentially dangerous
         """
         if not command:
             console.print("[bold red]No valid command generated.[/bold red]")
             return
-        
-        # Check for dangerous commands using local rules and AI
-        is_dangerous = self.is_dangerous_command(command)
-        
-        # Use AI to check if command is potentially dangerous when local check is negative
-        if not is_dangerous:
-            is_dangerous = self.check_command_danger_with_ai(command)
         
         # Show the command that will be executed
         console.print("\n[bold blue]Generated Command:[/bold blue]")
@@ -1058,8 +946,16 @@ class AITerminal:
             - Security vulnerabilities
             - Resource exhaustion
             - Privilege escalation
+            - Execution of untrusted code
+            - Files being moved to unintended locations
+            - Important system files being modified
             
-            Respond with ONLY "dangerous" or "safe" without any explanation.
+            Respond with a JSON object containing:
+            - "is_dangerous": true/false indicating if the command is potentially risky
+            - "reason": Brief explanation of your assessment
+            - "risk_level": A number from 0-10 indicating the risk level (0 = no risk, 10 = extreme risk)
+            
+            Be cautious - if there's any significant risk, mark the command as dangerous.
             """
             
             # Get directory context
@@ -1076,20 +972,26 @@ class AITerminal:
                 openai.chat.completions.create,
                 model=openai_model,
                 messages=messages,
-                max_tokens=10,
-                temperature=0
+                response_format={"type": "json_object"},
+                temperature=0.2
             )
             
-            # Extract the response text
-            response_text = response.choices[0].message.content.strip().lower()
-            self.log_debug(f"AI danger assessment: {response_text}")
+            # Parse the response
+            result = json.loads(response.choices[0].message.content)
+            self.log_debug(f"AI danger assessment: {result}")
             
-            # Check if the AI considers the command dangerous
-            return "dangerous" in response_text
+            # Log the assessment
+            self.logger.log_system_message(f"Command danger assessment: {'Dangerous' if result['is_dangerous'] else 'Safe'} (Risk level: {result['risk_level']})")
+            if 'reason' in result:
+                self.logger.log_system_message(f"Reason: {result['reason']}")
+            
+            # Return the danger assessment
+            return result['is_dangerous']
             
         except Exception as e:
             # Log the error
             self.log_debug(f"Error in AI danger check: {str(e)}")
+            self.logger.log_system_message(f"Error in danger assessment: {str(e)}")
             # Default to safe on API error to avoid disrupting workflow
             return False
     
@@ -1315,37 +1217,9 @@ class AITerminal:
         console.print("[bold blue]Agent Mode activated[/bold blue]")
         console.print(f"Task: [bold]{task}[/bold]")
         
-        # Check if this is a content creation task
-        content_creation_patterns = [
-            r'(write|create|generate|prepare).*report',
-            r'(write|create|generate|prepare).*article',
-            r'(write|create|generate|prepare).*document',
-            r'(write|create|generate|prepare).*summary',
-            r'(write|create|generate|prepare).*analysis',
-            r'history of',
-            r'research (on|about)',
-            r'write .*about',
-            r'create .*about',
-            r'report on',
-            r'details? (on|about)',
-            r'discuss .*history',
-            r'explain .*history',
-        ]
-        
-        is_content_task = any(re.search(pattern, task.lower()) for pattern in content_creation_patterns)
-        
-        # Also check for keywords indicating an analysis or detailed report
-        if not is_content_task and re.search(r'detailed|comprehensive|extensive|in-depth|thorough', task.lower()):
-            # If detailed work and likely not a terminal command, treat as content task
-            is_terminal_command = re.search(r'\b(ls|cd|mkdir|touch|rm|cp|mv|cat|grep|find|ps|kill|chmod|git|docker)\b', task.lower())
-            if not is_terminal_command:
-                is_content_task = True
-                self.logger.log_system_message("Content task detected based on detail level and non-terminal nature")
-                
-        # Check for structural indicators like sections or chapters
-        if not is_content_task and re.search(r'sections?|chapters?|parts?|segments?|headings?', task.lower()):
-            is_content_task = True
-            self.logger.log_system_message("Content task detected based on structural terms")
+        # Use API for intent classification
+        intent = self.classify_user_intent(task)
+        is_content_task = intent['primary_intent'] == 'content_creation'
         
         if is_content_task:
             console.print("[bold blue]Content creation task detected. Generating content...[/bold blue]")
@@ -1378,9 +1252,12 @@ class AITerminal:
         for i, step in enumerate(plan['steps'], 1):
             console.print(f"\n[bold blue]Step {i}/{len(plan['steps'])}: {step['description']}[/bold blue]")
             
-            # Execute with or without confirmation based on mode
-            if self.mode == "manual":
-                self.execute_with_confirmation(step['command'], f"Step {i}/{len(plan['steps'])}")
+            # Check if the command is dangerous using the API
+            danger_assessment = self.check_command_danger_with_ai(step['command'])
+            
+            # Execute with or without confirmation based on mode and danger level
+            if self.mode == "manual" or danger_assessment:
+                self.execute_with_confirmation(step['command'], f"Step {i}/{len(plan['steps'])}", is_dangerous=danger_assessment)
             else:
                 console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
                 output, success = self.execute_command(step['command'])
@@ -1813,6 +1690,7 @@ Please verify if this plan is sound and complete for accomplishing the task."""
     def is_shell_command(self, user_input: str) -> bool:
         """
         Determine if user input is likely a shell command that can be executed directly.
+        This method is kept for backward compatibility but now uses the API-based approach.
         
         Args:
             user_input: User's input
@@ -1820,39 +1698,15 @@ Please verify if this plan is sound and complete for accomplishing the task."""
         Returns:
             bool: True if the input appears to be a shell command, False otherwise
         """
-        # Trim leading/trailing whitespace
-        user_input = user_input.strip()
+        # Use the API-based classification instead of rule-based patterns
+        intent = self.classify_user_intent(user_input)
         
-        # Check if input is empty
-        if not user_input:
-            return False
+        # Log the classification result
+        self.log_debug(f"Shell command check via API: {intent['primary_intent']}")
         
-        # Common shell command patterns
-        shell_command_prefixes = [
-            'ls', 'cd', 'mkdir', 'touch', 'rm', 'cp', 'mv', 'cat', 'echo', 'grep',
-            'find', 'ps', 'kill', 'chmod', 'chown', 'tar', 'zip', 'unzip', 'ssh',
-            'scp', 'git', 'npm', 'pip', 'python', 'node', 'brew', 'apt', 'yum',
-            'docker', 'kubectl', 'aws', 'curl', 'wget', 'sudo', 'vim', 'nano'
-        ]
-        
-        # Check if input starts with a common shell command
-        first_word = user_input.split()[0]
-        
-        if first_word in shell_command_prefixes:
-            self.log_debug(f"Detected shell command: {user_input}")
-            return True
-            
-        # Check if input contains shell operators or pipes
-        shell_operators = ['|', '>', '>>', '<', '&&', '||', ';', '&']
-        for operator in shell_operators:
-            if operator in user_input:
-                # Make sure the operator isn't part of a quoted string
-                if not self._is_in_quotes(user_input, operator):
-                    self.log_debug(f"Detected shell operator in command: {user_input}")
-                    return True
-                    
-        return False
-        
+        # Return true if the API classified this as a direct command
+        return intent['primary_intent'] == 'direct_command'
+    
     def _is_in_quotes(self, text: str, substring: str) -> bool:
         """
         Check if a substring appears only inside quotes in the text.
@@ -1942,6 +1796,86 @@ Please verify if this plan is sound and complete for accomplishing the task."""
             # Log error but continue with original query
             self.log_debug(f"Error refining query: {str(e)}")
             return user_input
+            
+    def classify_user_intent(self, user_input: str) -> Dict[str, Any]:
+        """
+        Unified function to classify user input intent using the API,
+        replacing multiple rule-based detection methods.
+        
+        Args:
+            user_input: User's input text
+            
+        Returns:
+            Dict[str, Any]: Classification results with intent categories and confidence scores
+        """
+        self.log_debug(f"Classifying user intent: {user_input}")
+        
+        # Get context information
+        dir_context = self.get_directory_context()
+        conversation_history = self.logger.get_conversation_history()
+        
+        # Create a system message for intent classification
+        system_message = """You are an AI assistant that classifies user input intent for a terminal assistant.
+        Your task is to analyze user input and determine the type of request.
+        
+        Respond with a JSON object containing the following fields:
+        - "primary_intent": One of the following categories:
+          * "general_information" - General information question that doesn't require command execution
+          * "content_creation" - Writing, reporting, documentation, analysis
+          * "complex_task" - Task requiring multiple commands/steps
+          * "context_request" - User asking about previous actions/commands
+          * "direct_command" - A specific shell command
+          * "simple_task" - Simple task requiring a single command
+          
+        - "confidence": Confidence score (0-1) for the primary intent
+        - "dangerous_command": Boolean indicating if this might be a dangerous command (if applicable)
+        - "requires_agent_mode": Boolean indicating if this task should use agent mode
+        - "analysis": Brief explanation of why this classification was chosen
+        
+        Base your classification on the specific request, directory context, and conversation history.
+        """
+        
+        # Create the messages for the API call
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Classify this user input: '{user_input}'\n\nDirectory Information:\n{dir_context}\n\nRecent Conversation History:\n{conversation_history}"}
+        ]
+        
+        try:
+            # Call OpenAI API with the request
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.2
+            )
+            
+            # Extract and parse the classification result
+            classification = json.loads(response.choices[0].message.content)
+            self.log_debug(f"Intent classification result: {classification}")
+            
+            # Log the classification decision
+            self.logger.log_system_message(f"Intent classification: {classification['primary_intent']} (confidence: {classification['confidence']})")
+            if 'analysis' in classification:
+                self.logger.log_system_message(f"Analysis: {classification['analysis']}")
+            
+            return classification
+            
+        except Exception as e:
+            # Log error and return a default classification
+            error_msg = f"Error in intent classification: {str(e)}"
+            self.log_debug(error_msg)
+            self.logger.log_system_message(error_msg)
+            
+            # Return a conservative default
+            return {
+                "primary_intent": "simple_task",  # Default to simple task
+                "confidence": 0.5,
+                "dangerous_command": False,
+                "requires_agent_mode": False,
+                "analysis": "Classification failed, defaulting to simple task"
+            }
 
 
 class MemoryManager:
