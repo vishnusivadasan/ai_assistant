@@ -229,6 +229,7 @@ class AITerminal:
         self.mode = mode
         self.debug = debug
         self.memory = MemoryManager()  # Keep for backward compatibility
+        self.memory.ai_terminal = self  # Set reference to this instance
         self.shell = os.environ.get("SHELL", "/bin/zsh")
         self.command_history = []
         self.max_plan_iterations = max_plan_iterations
@@ -670,11 +671,15 @@ class AITerminal:
         elif primary_intent == "direct_command" and self.direct_execution:
             # Handle direct shell commands
             console.print("[blue]Detected shell command. Executing directly...[/blue]")
-            is_dangerous = intent.get('dangerous_command', False)
             
+            # Get danger assessment from intent classification or perform it
+            is_dangerous = intent.get('dangerous_command', False)
+            if 'dangerous_command' not in intent:
+                is_dangerous = self.check_command_danger_with_ai(refined_input)
+                
             if is_dangerous:
                 console.print("[bold yellow]This command may have potential risks.[/bold yellow]")
-                self.execute_with_confirmation(refined_input, "Direct shell command execution")
+                self.execute_with_confirmation(refined_input, "Direct shell command execution", is_dangerous=True)
             else:
                 self.execute_command(refined_input)
             return
@@ -792,21 +797,11 @@ class AITerminal:
         Returns:
             str: Generated shell command
         """
-        # First check if this is a content creation task that should be handled elsewhere
-        content_task_patterns = [
-            r'(write|create|generate|prepare).*report',
-            r'(write|create|generate|prepare).*article',
-            r'(write|create|generate|prepare).*document',
-            r'(write|create|generate|prepare).*summary',
-            r'(write|create|generate|prepare).*analysis',
-            r'history of',
-            r'research (on|about)',
-        ]
-        
-        for pattern in content_task_patterns:
-            if re.search(pattern, user_input.lower()):
-                self.log_debug(f"Content creation task detected in generate_command: {user_input}")
-                return "echo 'This is a content creation task that will be handled by Agent Mode. Please try again and make sure direct execution is not enabled.'"
+        # Check if this is a content creation task using API-based classification
+        intent = self.classify_user_intent(user_input)
+        if intent['primary_intent'] == 'content_creation':
+            self.log_debug(f"Content creation task detected in generate_command via API: {user_input}")
+            return "echo 'This is a content creation task that will be handled by Agent Mode. Please try again and make sure direct execution is not enabled.'"
         
         system_message = """You are an AI assistant that converts natural language requests into macOS terminal commands.
         Generate the exact shell command(s) that would accomplish the task. Provide ONLY the command, nothing else.
@@ -882,6 +877,10 @@ class AITerminal:
         if context:
             console.print(f"[dim]{context}[/dim]")
         
+        # If danger wasn't already assessed, use API-based check
+        if not is_dangerous:
+            is_dangerous = self.check_command_danger_with_ai(command)
+            
         # Only ask for confirmation if command is potentially dangerous
         execute = True
         if is_dangerous:
@@ -897,6 +896,7 @@ class AITerminal:
     def is_dangerous_command(self, command: str) -> bool:
         """
         Check if a command is potentially dangerous.
+        This method is kept for backward compatibility but now uses the API-based approach.
         
         Args:
             command: Shell command to check
@@ -904,24 +904,8 @@ class AITerminal:
         Returns:
             bool: True if command appears dangerous, False otherwise
         """
-        command_lower = command.lower()
-        
-        # Check against list of known dangerous commands
-        for dangerous_cmd in DANGEROUS_COMMANDS:
-            if dangerous_cmd in command_lower:
-                return True
-        
-        # Check for sudo commands that remove things
-        if "sudo" in command_lower and ("rm -rf" in command_lower or "rmdir" in command_lower):
-            return True
-            
-        # Check for commands that might affect large areas of the filesystem
-        if "rm -rf" in command_lower and ("/" in command_lower or "~" in command_lower):
-            # Allow if it's a specific subdirectory, but not broad areas
-            if not re.search(r'rm -rf ["\']?[a-zA-Z0-9_\-\.]+["\']?/?$', command_lower):
-                return True
-        
-        return False
+        self.log_debug(f"is_dangerous_command called (using API-based approach): {command}")
+        return self.check_command_danger_with_ai(command)
     
     def check_command_danger_with_ai(self, command: str) -> bool:
         """
@@ -935,6 +919,27 @@ class AITerminal:
         """
         try:
             self.log_debug(f"Checking command danger with AI: {command}")
+            
+            # First try to use the classification result if it already includes danger assessment
+            intent = self.classify_user_intent(command)
+            if 'dangerous_command' in intent:
+                danger_assessment = intent['dangerous_command']
+                self.log_debug(f"Using danger assessment from classify_user_intent: {danger_assessment}")
+                
+                # Log the assessment details
+                if 'risk_level' in intent:
+                    self.logger.log_system_message(f"Command risk level: {intent['risk_level']}/10")
+                if 'risk_reasons' in intent and intent['risk_reasons']:
+                    if isinstance(intent['risk_reasons'], list):
+                        self.logger.log_system_message(f"Risk reasons: {', '.join(intent['risk_reasons'])}")
+                    else:
+                        self.logger.log_system_message(f"Risk reason: {intent['risk_reasons']}")
+                        
+                return danger_assessment
+            
+            # If classification didn't include danger assessment, use a dedicated check
+            # Get directory context
+            dir_context = self.get_directory_context()
             
             # Create a system message for danger assessment
             system_message = """You are an AI assistant that assesses the safety of shell commands.
@@ -953,12 +958,10 @@ class AITerminal:
             - "is_dangerous": true/false indicating if the command is potentially risky
             - "reason": Brief explanation of your assessment
             - "risk_level": A number from 0-10 indicating the risk level (0 = no risk, 10 = extreme risk)
+            - "risk_areas": List of specific areas of risk (e.g., "data loss", "system integrity", etc.)
             
             Be cautious - if there's any significant risk, mark the command as dangerous.
             """
-            
-            # Get directory context
-            dir_context = self.get_directory_context()
             
             # Create the message list
             messages = [
@@ -983,6 +986,11 @@ class AITerminal:
             self.logger.log_system_message(f"Command danger assessment: {'Dangerous' if result['is_dangerous'] else 'Safe'} (Risk level: {result['risk_level']})")
             if 'reason' in result:
                 self.logger.log_system_message(f"Reason: {result['reason']}")
+            if 'risk_areas' in result and result['risk_areas']:
+                if isinstance(result['risk_areas'], list):
+                    self.logger.log_system_message(f"Risk areas: {', '.join(result['risk_areas'])}")
+                else:
+                    self.logger.log_system_message(f"Risk area: {result['risk_areas']}")
             
             # Return the danger assessment
             return result['is_dangerous']
@@ -1216,11 +1224,17 @@ class AITerminal:
         console.print("[bold blue]Agent Mode activated[/bold blue]")
         console.print(f"Task: [bold]{task}[/bold]")
         
-        # Use API for intent classification
+        # Use API for complete task classification and analysis
         intent = self.classify_user_intent(task)
-        is_content_task = intent['primary_intent'] == 'content_creation'
+        primary_intent = intent.get('primary_intent', 'complex_task')
         
-        if is_content_task:
+        # Log the classification result
+        self.logger.log_system_message(f"Agent mode task classification: {primary_intent}")
+        if 'analysis' in intent:
+            self.logger.log_system_message(f"Task analysis: {intent['analysis']}")
+        
+        # Handle content creation tasks differently
+        if primary_intent == 'content_creation':
             console.print("[bold blue]Content creation task detected. Generating content...[/bold blue]")
             self.handle_content_creation_task(task)
             return
@@ -1235,20 +1249,64 @@ class AITerminal:
         # Verify and refine the plan through iterations
         plan = self.verify_and_refine_plan(task, plan)
             
-        # Display the final plan
+        # Group steps by phase
+        analysis_steps = [s for s in plan['steps'] if s.get('phase', '') == 'analysis']
+        planning_steps = [s for s in plan['steps'] if s.get('phase', '') == 'planning']
+        execution_steps = [s for s in plan['steps'] if s.get('phase', '') == 'execution']
+        other_steps = [s for s in plan['steps'] if s.get('phase', '') not in ['analysis', 'planning', 'execution']]
+        
+        # Display the final plan with phases
         console.print("\n[bold blue]Execution Plan:[/bold blue]")
-        for i, step in enumerate(plan['steps'], 1):
-            console.print(f"[bold]{i}.[/bold] {step['description']}")
-            console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
-            console.print()
+        
+        # Display phases separately with headers
+        if analysis_steps:
+            console.print("\n[bold yellow]PHASE 1: ANALYSIS & DISCOVERY[/bold yellow]")
+            for i, step in enumerate(analysis_steps, 1):
+                console.print(f"[bold]{i}.[/bold] {step['description']}")
+                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+                console.print()
+        
+        if planning_steps:
+            console.print("\n[bold green]PHASE 2: PLANNING[/bold green]")
+            for i, step in enumerate(planning_steps, 1):
+                console.print(f"[bold]{i}.[/bold] {step['description']}")
+                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+                console.print()
+        
+        if execution_steps:
+            console.print("\n[bold blue]PHASE 3: EXECUTION[/bold blue]")
+            for i, step in enumerate(execution_steps, 1):
+                console.print(f"[bold]{i}.[/bold] {step['description']}")
+                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+                console.print()
+        
+        if other_steps:
+            console.print("\n[bold purple]OTHER STEPS[/bold purple]")
+            for i, step in enumerate(other_steps, 1):
+                console.print(f"[bold]{i}.[/bold] {step['description']}")
+                console.print(Syntax(step['command'], "bash", theme="monokai", line_numbers=False))
+                console.print()
         
         # Ask for confirmation to execute the plan
         if self.mode == "manual" and not Confirm.ask("Execute this plan?", default=True):
             console.print("[blue]Plan execution cancelled.[/blue]")
             return
         
-        # Execute each step in the plan
+        # Execute each step in the plan - retain original order for execution
+        current_phase = None
         for i, step in enumerate(plan['steps'], 1):
+            # Check if we're entering a new phase
+            step_phase = step.get('phase', 'other')
+            if step_phase != current_phase:
+                current_phase = step_phase
+                phase_name = {
+                    'analysis': "[bold yellow]PHASE 1: ANALYSIS & DISCOVERY[/bold yellow]",
+                    'planning': "[bold green]PHASE 2: PLANNING[/bold green]",
+                    'execution': "[bold blue]PHASE 3: EXECUTION[/bold blue]",
+                    'other': "[bold purple]OTHER STEPS[/bold purple]"
+                }.get(step_phase, "[bold purple]OTHER STEPS[/bold purple]")
+                console.print(f"\n{phase_name}")
+            
             console.print(f"\n[bold blue]Step {i}/{len(plan['steps'])}: {step['description']}[/bold blue]")
             
             # Check if the command is dangerous using the API
@@ -1461,11 +1519,28 @@ class AITerminal:
         """
         # Get step-by-step plan from OpenAI
         system_message = """You are an AI assistant that breaks down complex tasks into a series of shell commands for macOS.
+        Your approach should mirror human-like reasoning by ALWAYS following these phases:
+
+        PHASE 1: ANALYSIS & DISCOVERY
+        - List and examine what exists in the environment
+        - Categorize what you find (file types, structures, patterns)
+        - Understand the current state before making changes
+        
+        PHASE 2: PLANNING
+        - Based on your analysis, develop a thoughtful approach
+        - Consider multiple ways to accomplish the goal
+        - Choose the most appropriate method based on context
+
+        PHASE 3: EXECUTION
+        - Only after thorough analysis, create commands to accomplish the goal
+        - Include verification steps to confirm actions worked as expected
+        
         Create a step-by-step plan with specific shell commands to accomplish the user's goal.
         Format your response as JSON with an array of steps, each with:
         - description: Brief description of what this step does
         - command: The exact shell command to run
         - critical: Boolean indicating if this step is critical (failure should stop execution)
+        - phase: String indicating which phase this step belongs to ("analysis", "planning", or "execution")
         
         IMPORTANT GUIDELINES FOR COMMAND EXECUTION:
         
@@ -1482,6 +1557,50 @@ class AITerminal:
         3. Avoid unnecessary 'cd' commands when you can specify the full path directly
         
         4. For multi-part operations in the same directory, consider combining them with '&&' in a single step
+        
+        EXAMPLE OF A WELL-STRUCTURED PLAN:
+        ```
+        {
+          "steps": [
+            {
+              "description": "Analyze what files and directories exist in the current location",
+              "command": "find . -type f -o -type d | sort",
+              "critical": true,
+              "phase": "analysis"
+            },
+            {
+              "description": "Examine file types to understand what we're working with",
+              "command": "find . -type f -exec file {} \\;",
+              "critical": true,
+              "phase": "analysis"
+            },
+            {
+              "description": "Check for large files that might need special handling",
+              "command": "find . -type f -size +10M -exec ls -lh {} \\;",
+              "critical": false,
+              "phase": "analysis"
+            },
+            {
+              "description": "Based on analysis, create a directory structure for organization",
+              "command": "mkdir -p media/images documents/text data/csv",
+              "critical": true,
+              "phase": "planning"
+            },
+            {
+              "description": "Move image files to the images directory",
+              "command": "find . -maxdepth 1 -type f -name '*.jpg' -o -name '*.png' -exec mv {} ./media/images/ \\;",
+              "critical": true,
+              "phase": "execution"
+            },
+            {
+              "description": "Verify files were moved successfully",
+              "command": "ls -la ./media/images/",
+              "critical": false,
+              "phase": "execution"
+            }
+          ]
+        }
+        ```
         """
         
         # Get directory context
@@ -1493,7 +1612,9 @@ Directory Information:
 {dir_context}
 
 IMPORTANT NOTE: Remember that each command runs separately, so directory changes with 'cd' won't persist across steps. 
-Use absolute paths, combined commands with &&, or ensure your paths account for this limitation."""
+Use absolute paths, combined commands with &&, or ensure your paths account for this limitation.
+
+REMEMBER: Follow the human-like reasoning process by first analyzing what exists, then planning, and finally executing the plan."""
         
         messages = [
             {"role": "system", "content": system_message},
@@ -1597,7 +1718,22 @@ Use absolute paths, combined commands with &&, or ensure your paths account for 
         4. There are no missing steps
         5. There are no unnecessary steps
         
-        IMPORTANT: Pay special attention to these common issues:
+        IMPORTANT: The plan must follow a human-like reasoning process with these phases:
+        
+        PHASE 1: ANALYSIS & DISCOVERY
+        - At least 2-3 steps should be dedicated to analyzing what exists before taking action
+        - The plan should include commands to list and examine files/directories
+        - There should be steps to categorize or understand the content (file types, sizes, etc.)
+        
+        PHASE 2: PLANNING
+        - Based on the analysis, the plan should include steps for organizing the approach
+        - This may include creating directory structures or determining what needs to be done
+        
+        PHASE 3: EXECUTION
+        - Only after thorough analysis and planning should the actual task be executed
+        - Verification steps should be included to confirm actions worked as expected
+        
+        CRITICAL ISSUES TO CHECK:
         
         - Directory persistence: When the plan includes a 'cd' command, subsequent commands will NOT inherit the directory change when executed separately.
           This is because each command runs in its own subprocess. Fix this by either:
@@ -1616,7 +1752,7 @@ Use absolute paths, combined commands with &&, or ensure your paths account for 
         If improvements are needed, provide a refined plan in the same format.
         Format your response as JSON with:
         - is_good: Boolean indicating if the plan is sound (true) or needs refinement (false)
-        - feedback: Brief explanation of your assessment, particularly highlighting issues like directory persistence
+        - feedback: Brief explanation of your assessment, particularly highlighting issues like directory persistence or missing analysis steps
         - refined_plan: The improved plan if is_good is false, otherwise null
         """
         
@@ -1636,6 +1772,7 @@ Recent Conversation History:
 {conv_history}
 
 Please verify if this plan is sound and complete for accomplishing the task. 
+The plan MUST follow a human-like reasoning process with proper analysis steps before taking action.
 Pay special attention to directory persistence issues - if any step changes directory with 'cd', subsequent commands need to account for this by either using absolute paths or combining commands with &&."""
         
         messages = [
@@ -1867,8 +2004,19 @@ Pay special attention to directory persistence issues - if any step changes dire
           
         - "confidence": Confidence score (0-1) for the primary intent
         - "dangerous_command": Boolean indicating if this might be a dangerous command (if applicable)
+        - "risk_level": Number from 0-10 indicating potential risk level of the command (if applicable)
+        - "risk_reasons": List of reasons why the command is risky (if applicable)
         - "requires_agent_mode": Boolean indicating if this task should use agent mode
         - "analysis": Brief explanation of why this classification was chosen
+        
+        When assessing command danger, consider:
+        - Data deletion or modification risks
+        - System-wide changes
+        - Privilege escalation
+        - Resource exhaustion
+        - Security implications
+        - Network and external access
+        - Irreversible actions
         
         Base your classification on the specific request, directory context, and conversation history.
         """
@@ -1898,6 +2046,12 @@ Pay special attention to directory persistence issues - if any step changes dire
             if 'analysis' in classification:
                 self.logger.log_system_message(f"Analysis: {classification['analysis']}")
             
+            # Log risk assessment if available
+            if 'risk_level' in classification:
+                self.logger.log_system_message(f"Risk assessment: Level {classification['risk_level']}/10")
+                if 'risk_reasons' in classification and classification['risk_reasons']:
+                    self.logger.log_system_message(f"Risk reasons: {', '.join(classification['risk_reasons'])}")
+            
             return classification
             
         except Exception as e:
@@ -1925,6 +2079,8 @@ class MemoryManager:
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
         self.setup_tables()
+        # Store a reference to the parent AITerminal instance when it's created
+        self.ai_terminal = None
     
     def __del__(self):
         """Close database connection when object is destroyed."""
@@ -2089,13 +2245,57 @@ class MemoryManager:
     def extract_and_store_entities(self, command: str, result: str, conversation_id: int):
         """
         Extract and store entities (files, directories) referenced in commands and results.
+        Uses AI-based entity extraction if available, falls back to regex-based approach otherwise.
         
         Args:
             command: Executed command
             result: Command output
             conversation_id: ID of the associated conversation log entry
         """
-        # Extract file operations (create, delete, modify)
+        timestamp = datetime.now().isoformat()
+        entities_to_store = []
+        
+        # Try to use AI-based entity extraction if we have access to AITerminal instance
+        if hasattr(self, 'ai_terminal') and self.ai_terminal:
+            try:
+                # Get entities using the API
+                ai_entities = self.ai_terminal.extract_entities_with_ai(command, result)
+                
+                # Convert AI extracted entities to the format needed for storage
+                for entity in ai_entities:
+                    entity_name = entity.get('entity_name', '')
+                    entity_type = entity.get('entity_type', 'file')
+                    path = entity.get('path', entity_name)
+                    action = entity.get('action', 'unknown')
+                    
+                    # Skip if no entity name
+                    if not entity_name:
+                        continue
+                        
+                    # Get absolute path if relative
+                    if path and not os.path.isabs(path):
+                        path = os.path.abspath(os.path.join(os.getcwd(), path))
+                    
+                    entities_to_store.append((timestamp, entity_type, entity_name, path, action, conversation_id))
+                
+                # If we got entities from AI, skip regex extraction
+                if entities_to_store:
+                    # Store the extracted entities
+                    for entity in entities_to_store:
+                        self.cursor.execute(
+                            "INSERT INTO entities (timestamp, entity_type, name, path, action, conversation_id) VALUES (?, ?, ?, ?, ?, ?)",
+                            entity
+                        )
+                    
+                    self.conn.commit()
+                    return
+            except Exception as e:
+                # If AI extraction fails, fall back to regex-based approach
+                print(f"AI entity extraction failed, falling back to regex: {e}")
+        
+        # Fall back to regex-based extraction if AI extraction is unavailable or failed
+        
+        # Original regex-based extraction logic
         file_patterns = {
             'create': [
                 r'touch\s+([^\s;|&]+)',  # touch file.txt
@@ -2118,7 +2318,6 @@ class MemoryManager:
             ]
         }
         
-        timestamp = datetime.now().isoformat()
         entities_to_store = []
         
         # Process each action type
@@ -2314,6 +2513,82 @@ class MemoryManager:
             memories.append(dict(row))
         
         return memories
+    
+    def extract_entities_with_ai(self, command: str, result: str) -> List[Dict]:
+        """
+        Use the API to extract entities (files, directories, etc.) from commands and results.
+        
+        Args:
+            command: The executed command
+            result: The command output
+            
+        Returns:
+            List[Dict]: List of extracted entities with their properties
+        """
+        self.log_debug(f"Extracting entities using API for command: {command}")
+        
+        # Create system message for entity extraction
+        system_message = """You are an AI assistant that analyzes shell commands and their outputs to extract entities.
+        Identify all files, directories, and other entities being operated on in the command.
+        
+        Focus on:
+        1. Files or directories being created, modified, read, deleted, or otherwise manipulated
+        2. The types of operations performed on them (create, read, write, delete, etc.)
+        3. Absolute or relative paths when present
+        
+        For each entity, provide:
+        - entity_name: Name of the file/directory/entity
+        - entity_type: Type (file, directory, etc.)
+        - action: The operation being performed (create, read, write, delete, list, etc.)
+        - path: Full path when possible, otherwise the path as specified in the command
+        
+        Format your response as a JSON array of entity objects.
+        If no entities can be identified, return an empty array.
+        """
+        
+        # Get directory context for better path resolution
+        dir_context = self.get_directory_context()
+        
+        # Create user message with command, result, and context
+        user_message = f"""Command: {command}
+
+Command Output:
+{result}
+
+Current Directory Context:
+{dir_context}
+
+Extract all entities (files, directories, etc.) being operated on in this command."""
+        
+        # Create messages for the API call
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message}
+        ]
+        
+        try:
+            # Call OpenAI API with animation
+            response = self.call_api_with_animation(
+                openai.chat.completions.create,
+                model=openai_model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.2
+            )
+            
+            # Parse the response
+            result = json.loads(response.choices[0].message.content)
+            entities = result.get('entities', [])
+            if not isinstance(entities, list):
+                entities = result if isinstance(result, list) else []
+                
+            self.log_debug(f"API extracted {len(entities)} entities from command")
+            return entities
+            
+        except Exception as e:
+            error_msg = f"Error extracting entities from command: {str(e)}"
+            self.log_debug(error_msg)
+            return []
 
 
 def parse_args():
